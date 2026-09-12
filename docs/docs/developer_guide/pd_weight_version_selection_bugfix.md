@@ -1,98 +1,258 @@
-# gRPC PD weight-version selection bugfix
+# Snapshot-serving A100 environment and PD weight-version report
 
-## 结论
+## Outcome
 
-`PolicyKV-PD` 章程描述的请求级快照一致性是合理的长期目标，但它包含选择、重试、
-worker 接单、权重更新和 KV 传输五个不同问题。当前已复现的 bug 只位于 gRPC
-Gateway 的 P/D worker 选择层，因此本次交付只关闭这个最小闭环，不等待 GPU 实验。
+The clean repository at commit `0b3bb0cbe31873994c9f989fddfe2f87ca839fdd`
+(`v0.5.15.post1`) now has an independent CUDA 12.9 environment and a validated
+A100 execution path. Qwen3-4B passed both a TP=1 greedy/logprob request and a
+real two-GPU prefill/decode request using NIXL/UCX KV transfer.
 
-本次可以声明：当 gRPC worker metadata 提供 `weight_version` 时，Gateway 不会选择
-已知版本不同的 P/D 组合，并且候选池中存在同版本组合时仍能找到该组合。
+The Gateway now enforces compatible P/D `weight_version` metadata on both gRPC
+and HTTP paths, supports opt-in strict metadata validation, and pins the chosen
+version across retries. This closes the known Gateway selection and retry
+drift bugs. It does not yet provide a worker-side transactional snapshot
+admission protocol; that remaining boundary is described below.
 
-不能据此声明：一次请求在重试、worker 权重更新或 KV 传输期间始终绑定同一快照。
+## A100 source-environment investigation
 
-## 问题
+Read-only inspection of `ai_hgx_03` found:
 
-修复前，gRPC PD selector 分别在所有可用 prefill 和 decode worker 中调用 policy。
-因此只有 `P(v10)` 和 `D(v11)` 时会返回异版本组合；如果
-`P={v10,v11}, D={v11}`，先独立选择再比较版本还可能错误拒绝本来存在的合法组合。
+- eight `NVIDIA A100-SXM4-80GB` GPUs (81920 MiB each);
+- NVIDIA driver `550.90.07`;
+- Linux `3.10.0-957.el7.x86_64`, x86_64, glibc `2.31`;
+- CUDA compiler and `ptxas` from the `slime` environment at CUDA `12.9.86`;
+- Python `3.12.13`, torch `2.11.0+cu129`, FlashInfer Python/cubin `0.6.12`,
+  `sglang-kernel 0.4.5+cu129`, and `sgl-deep-gemm 0.1.4+cu129`.
 
-补丁前定向回归结果：
-
-```text
-running 2 tests
-matching_pair_is_selected ... ok
-mismatched_pair_is_rejected ... FAILED
-
-left:  Some(("v10", "v11"))
-right: None
-```
-
-## 修复
-
-修改文件：
+The old environment is not a clean upstream baseline. Its editable SGLang
+installation reports version `0.0.0` and points to:
 
 ```text
-sgl-model-gateway/src/routers/grpc/common/stages/worker_selection.rs
+/public/home/yingxy2024/moe-consistency/sglang/python
 ```
 
-选择顺序现在是：
-
-1. 保留原有 model、连接模式、role、健康状态过滤。
-2. 删除没有任何同 `weight_version` decode 候选的 prefill worker。
-3. 在剩余 prefill 候选中调用原有 policy。
-4. 只保留与所选 prefill 同版本的 decode 候选，再调用原有 policy。
-
-版本是 hard constraint，policy 仍负责在合法候选中做原有负载或缓存策略选择。
-没有采用“先分别选择、版本不同再拒绝”的实现。
-
-为了兼容没有发布版本 metadata 的旧部署，两个都缺少 `weight_version` 的 worker
-仍视为同一个 legacy 组；只有一侧缺失时不会与已知版本配对。这不是完整 strict
-snapshot 身份保证。
-
-## 验证
-
-运行：
-
-```bash
-bash .local/run-cpu-regression.sh
-```
-
-补丁后结果：
+The existing launcher
+`moe-consistency/experiments/run_sglang_qwen3_a100_deepep_triton.sh` overrides
+that editable install again through `PYTHONPATH`, loading:
 
 ```text
-running 3 tests
-test_pd_weight_version_matching_pair_is_selected ... ok
-test_pd_weight_version_mismatched_pair_is_rejected ... ok
-test_pd_weight_version_matching_pair_is_found_in_mixed_pool ... ok
-
-test result: ok. 3 passed; 0 failed
+/public/home/yingxy2024/moe-consistency/experiments/sglang-main-sm80/python
 ```
 
-同时通过 `cargo fmt --check` 和 `git diff --check`。这些测试直接调用真实 selector，
-不启动 server，也不需要 GPU。
+It is configured for a different model (`Qwen3-30B-A3B-2layer`), GPUs 4-7,
+TP=4, EP=4, DeepEP, Triton attention, and PyTorch sampling. No log containing a
+server-ready or inference-batch success marker was found under that experiment
+directory. Consequently, the old evidence proves package installation and
+import only; the script's existence is not treated as a successful run.
 
-## 提交
+## Target selection and independent environment
+
+The first validated target is `ai_hgx_03`, not the L20 host. This keeps the
+known CUDA 12.9 package family and the A100 architecture while removing the
+editable-source mixture. It avoids changing hardware and software at the same
+time. The shared environment has not been accepted on L20; an L20 run remains
+a separate sm89 migration test with its own JIT cache.
+
+Environment:
+
+```text
+/storage/data/yingxy2024/envs/sglang-pd-repro
+```
+
+Verified core versions:
+
+| Component | Installed version/source |
+| --- | --- |
+| Python | 3.12.13 |
+| torch | 2.11.0+cu129, inherited from the working CUDA 12.9 package stack |
+| CUDA toolkit/nvcc/ptxas | 12.9.86 |
+| flashinfer-python | 0.6.12, inherited CUDA 12 stack |
+| flashinfer-cubin | 0.6.12, inherited CUDA 12 stack |
+| sglang-kernel | 0.4.4+cu129, local `sglang_kernel-0.4.4+cu129-cp310-abi3-manylinux2014_x86_64.whl` |
+| sglang-kernel wheel SHA256 | `4ea2f7176965c3d1a5697254befe45c2ac995793577108129710d0f66ca85b33` |
+| sgl-deep-gemm | 0.1.4+cu129, inherited but not used by this validation |
+| nixl / nixl-cu12 | 1.3.0 / 1.3.0 |
+| sglang-router | 0.3.2 |
+| sglang | editable from this repository's `python/` directory, installed without dependency resolution |
+
+The kernel wheel came from
+`/public/home/yingxy2024/.tmp-codex/moe-a100-wheels/`. Its directory name was
+not used as compatibility evidence: the final evidence is the successful sm80
+JIT, kernel load, model execution, and PD request.
+
+Intentional or inherited deviations from the repository declaration are:
+
+- CUDA 12.9 (`cuda-python 12.9.0` and CUDA-12 FlashInfer artifacts) instead of
+  the declared CUDA 13 family;
+- `sglang-kernel 0.4.4+cu129`, matching the repository's 0.4.4 API version but
+  using the CUDA 12.9 build suffix;
+- inherited cuDNN `9.16.0.29` instead of torch's declared `9.17.1.4`;
+- no `flash-attn-4`; it is not used by the validated FlashInfer path;
+- inherited NumPy `1.26.4` versus a newer optional `tifffile` requirement;
+- an unsupported-platform `transformer-engine` marker.
+
+`pip install --no-deps -e` was used only to prevent dependency replacement.
+Compatibility is supported by the actual GPU tests below, not by that install
+command.
+
+### Why Mooncake is not required here
+
+`mooncake-transfer-engine==0.3.11.post1` exists on PyPI, but its Linux x86_64
+wheel requires glibc 2.35. Both target hosts have glibc 2.31 and the release
+has no source distribution, so pip has no compatible artifact. SGLang's PD
+path also supports NIXL; this reproduction uses the exact CUDA-12 pair
+`nixl==1.3.0` and `nixl-cu12==1.3.0`. Both P and D initialized the UCX backend
+and completed a real request, so Mooncake is not necessary for this baseline.
+
+The environment-local libnl SONAME links are kept ahead of system libnl to
+avoid the NIXL wheel/system-library collision. Per-host cache directories keep
+sm80 and sm89 CUDA, FlashInfer, Torch-extension, Triton, and TVM-FFI artifacts
+separate. CUDA runtime library directories are also in `LIBRARY_PATH`, which
+fixed FlashInfer JIT's final `-lcudart` link on the A100 host. `TMPDIR` points
+to storage because the host's system `/tmp` was full; no system files were
+removed.
+
+## Gateway changes
+
+### Selection and metadata
+
+The original gRPC selector independently selected P and D workers and could
+return `P(v10)+D(v11)`. It now filters by compatible versions before invoking
+the existing load-balancing policies, so it can also find a valid matching
+pair inside a mixed candidate pool.
+
+The locked `smg-grpc-client 1.0.0` generated `GetModelInfoResponse` exposes
+`weight_version` as a top-level field. The regression test constructs that
+real response type and follows the production `to_labels()` chain into worker
+metadata and selection. It does not use a hand-written label mock for this
+metadata-chain test.
+
+HTTP discovery now copies `/model_info`'s `weight_version` into worker labels,
+and the HTTP PD selector applies the same constraint before its separate P/D
+policies.
+
+### Legacy and strict modes
+
+The Gateway option is:
+
+```text
+--pd-weight-version-mode legacy|strict
+```
+
+`legacy` is the default for backward compatibility: two missing versions are
+compatible, while one missing and one explicit version are not. `strict`
+requires the same non-empty explicit version and rejects the literal
+placeholder `default`.
+
+### Retry binding
+
+Both HTTP and gRPC create a request-local, shared `OnceLock<Option<String>>`.
+The first successful pair selection binds the version. Every subsequent retry
+filters candidates to that version, allowing a replacement worker at the same
+version but preventing drift from (for example) v10 to v11.
+
+The Bucket policy also verifies that its internally remembered URL remains in
+the version-filtered candidate slice. If not, it falls back to a healthy
+worker from the allowed slice rather than returning no worker.
+
+## Validation evidence
+
+### CPU/Gateway
+
+The targeted `test_pd_weight_version` suite passed 16 tests, covering gRPC and
+HTTP match, mismatch, mixed pools, real gRPC response metadata, legacy/strict
+modes, strict placeholder rejection, and retry drift. The Bucket filtered-set
+regression passed separately. `cargo check --locked --bins`, `cargo fmt
+--check`, and `git diff --check` are the final static/build gates.
+
+### A100 TP=1 model
+
+Model: `/storage/data/yingxy2024/Models/Qwen3-4B`; TP=1; FlashInfer attention
+and sampling. FlashInfer compiled for sm80, weights loaded, CUDA graphs were
+captured, and a greedy request with output logprobs succeeded.
+
+Prompt and generated text:
+
+```text
+The capital of France is
+ Paris. The capital of Germany is Berlin. The capital of
+```
+
+The response contains 12 output IDs and 12 output-token logprobs. Evidence:
+
+```text
+.local/logs/a100-single-qwen3-4b.log
+.local/logs/a100-single-greedy-logprob-response.json
+```
+
+### A100 P/D with NIXL
+
+P ran on GPU 6 at port 31001 with bootstrap port 39001; D ran on GPU 7 at
+31002; Gateway ran at 31003. Both workers logged `NIXL KVManager initialized
+with backend: UCX`, P started `CommonKVBootstrapServer` and processed a real
+prefill batch, and D returned generation. The routed request produced the same
+12 output IDs and logprobs as the TP=1 request and reported
+`weight_version="baseline"`.
+
+Evidence:
+
+```text
+.local/logs/a100-p-nixl.log
+.local/logs/a100-d-nixl.log
+.local/logs/a100-pd-router.log
+.local/logs/a100-pd-nixl-greedy-logprob-response.json
+```
+
+The GPU run used the environment's installed `sglang-router==0.3.2`, whose
+module is
+`.../site-packages/sglang_router/__init__.py`. Therefore the GPU result proves
+the clean SGLang/CUDA/NIXL model-serving baseline. The branch's new Rust
+Gateway selection logic is proven by the focused Rust tests, not by falsely
+claiming the installed wheel already contains these unbuilt branch changes.
+
+Reusable commands are tracked in `scripts/pd_snapshot_repro/`. The full smoke
+script checks GPU and port availability, launches only its own P/D/Gateway
+processes, validates the response and NIXL markers, and terminates only those
+processes on exit.
+
+## Remaining protocol boundary
+
+A worker-side strict reader-lock recheck cannot be implemented honestly as a
+small Gateway-only patch. This repository uses `smg-grpc-client 1.0.0`, while
+the environment has `smg-grpc-servicer 0.8.0` and `smg-grpc-proto 0.4.14`.
+Their generate/disaggregation request types carry bootstrap host, port, and
+room but no `required_weight_version`. In addition, the current external SMG
+gRPC request manager bypasses `TokenizerManager.model_update_lock`.
+
+Closing that boundary requires one coordinated change:
+
+1. add required snapshot identity to the SMG proto/client/servicer contract
+   and check it while holding the model-update reader lock; or
+2. finish migration to the repository's native gRPC bridge, which enters the
+   tokenizer manager, then add the same field and check there.
+
+The weight-update path should also publish `server_args.weight_version` inside
+the same writer-lock critical section as the weight swap. Today there is a
+small post-unlock metadata window. Until those changes land, this branch
+guarantees Gateway selection/retry consistency for observed registration
+metadata, not a full distributed transaction against an in-flight update.
+
+Other residual operational risks are stale registration metadata, manual
+labels overriding discovery, and deployments with cross-model routing enabled
+that reuse the same version string. Strict mode rejects `default` but cannot
+prove that two arbitrary identical strings refer to cryptographically
+identical weights.
+
+## Incremental commits
 
 ```text
 897ce89 test(gateway): reproduce PD weight version mismatch
 1eb0346 fix(gateway): keep PD workers on one weight version
+fab81ab docs: record PD version selection bugfix scope
+903936a test(gateway): cover gRPC weight metadata chain
+afa1376 feat(gateway): add strict PD weight selection
+50e1c5d fix(gateway): enforce PD versions for HTTP routing
+ef8ccea fix(gateway): pin PD version across retries
+8bb548b fix(gateway): keep bucket selection within filtered workers
+6febf29 chore(repro): add A100 NIXL PD smoke scripts
 ```
-
-第一项提交只保存补丁前会失败的回归；第二项提交包含 selector 修复及混合候选池回归。
-
-## 本次有意跳过
-
-- GPU 模型推理和真实 KV transfer：它们用于验证下游后果，不是证明 selector
-  是否返回异版本 pair 的必要条件。
-- Mooncake/NIXL 数据面：selector 修复与 transfer backend 无关。
-- HTTP PD 路径：当前 HTTP discovery 没有等价的可信 `weight_version` metadata 链路，
-  应作为独立补丁补 metadata 后再过滤，不能用 mock label 冒充完成。
-- retry 绑定、worker-side admission、权重更新事务和 transfer identity：属于完整
-  PolicyKV 契约，不能塞进这次小 bugfix 后宣称完成。
-
-## 下一步优先级
-
-如果实际故障流量走 gRPC，先用真实 worker registration 确认两侧 metadata 中确实带有
-`weight_version`，再做一次 Gateway 请求即可。只有实际部署走 HTTP，或者目标升级为完整
-请求级快照一致性时，才继续章程后续工作包。
