@@ -7,9 +7,10 @@ The clean repository at commit `0b3bb0cbe31873994c9f989fddfe2f87ca839fdd`
 A100 execution path. Qwen3-4B passed both a TP=1 greedy/logprob request and a
 real two-GPU prefill/decode request using NIXL/UCX KV transfer.
 
-The Gateway now enforces compatible P/D `weight_version` metadata on both gRPC
-and HTTP paths, supports opt-in strict metadata validation, and pins the chosen
-version across retries. This closes the known Gateway selection and retry
+In strict mode, the Gateway enforces compatible P/D model identity and
+`weight_version` metadata on both gRPC and HTTP paths, and pins the chosen
+version across retries. Legacy mode preserves upstream routing behavior.
+This closes the known Gateway selection and retry
 drift bugs. It does not yet provide a worker-side transactional snapshot
 admission protocol; that remaining boundary is described below.
 
@@ -117,7 +118,7 @@ removed.
 ### Selection and metadata
 
 The original gRPC selector independently selected P and D workers and could
-return `P(v10)+D(v11)`. It now filters by compatible versions before invoking
+return `P(v10)+D(v11)`. Strict mode now filters by compatible identities before invoking
 the existing load-balancing policies, so it can also find a valid matching
 pair inside a mixed candidate pool.
 
@@ -128,7 +129,7 @@ metadata and selection. It does not use a hand-written label mock for this
 metadata-chain test.
 
 HTTP discovery now copies `/model_info`'s `weight_version` into worker labels,
-and the HTTP PD selector applies the same constraint before its separate P/D
+and the strict HTTP PD selector applies the same constraint before its separate P/D
 policies.
 
 ### Legacy and strict modes
@@ -139,14 +140,26 @@ The Gateway option is:
 --pd-weight-version-mode legacy|strict
 ```
 
-`legacy` is the default for backward compatibility: two missing versions are
-compatible, while one missing and one explicit version are not. `strict`
-requires the same non-empty explicit version and rejects the literal
-placeholder `default`.
+`legacy` is the default and preserves original independent P/D selection,
+including mismatches and missing versions. It does not bind retry versions.
+This aligns with charter SEL-13; earlier commits used legacy for a more
+restrictive behavior, which has now been corrected.
+
+`strict` requires the same non-blank explicit version and rejects the literal
+placeholder `default`. It requires equal, known canonical model IDs. If either
+side publishes `model_path` or `deployment_scope`, both must publish the same
+non-blank value. Without a request model, there must be one compatible
+model/source/deployment identity. HTTP honors explicit request models in strict
+mode even with `enable_igw=false`.
+
+I-a supports a controlled registry with trusted registration and immutable
+version labels. Missing scope on both sides means the registry's one deployment;
+operators must assign scopes when sharing a registry across deployments.
+Matching paths and labels are registration identities, not checkpoint hashes.
 
 ### Retry binding
 
-Both HTTP and gRPC create a request-local, shared `OnceLock<Option<String>>`.
+In strict mode, HTTP and gRPC use a request-local shared `OnceLock<Option<String>>`.
 The first successful pair selection binds the version. Every subsequent retry
 filters candidates to that version, allowing a replacement worker at the same
 version but preventing drift from (for example) v10 to v11.
@@ -159,11 +172,11 @@ worker from the allowed slice rather than returning no worker.
 
 ### CPU/Gateway
 
-The targeted `test_pd_weight_version` suite passed 16 tests, covering gRPC and
-HTTP match, mismatch, mixed pools, real gRPC response metadata, legacy/strict
-modes, strict placeholder rejection, and retry drift. The Bucket filtered-set
-regression passed separately. `cargo check --locked --bins`, `cargo fmt
---check`, and `git diff --check` are the final static/build gates.
+The I-a closeout expands the original 16 focused tests to a 27-test contract
+suite. It covers model/source/deployment identity, legacy semantics, separate
+HTTP policies, filtered indices, hash and target headers, existing eligibility,
+and actual loopback HTTP discovery through production worker registration.
+The charter mapping and final run evidence are in [Phase I-a acceptance](phase_ia_acceptance.md).
 
 ### A100 TP=1 model
 
@@ -191,7 +204,7 @@ P ran on GPU 6 at port 31001 with bootstrap port 39001; D ran on GPU 7 at
 31002; Gateway ran at 31003. Both workers logged `NIXL KVManager initialized
 with backend: UCX`, P started `CommonKVBootstrapServer` and processed a real
 prefill batch, and D returned generation. The routed request produced the same
-12 output IDs and logprobs as the TP=1 request and reported
+12 output IDs and numerically matching logprobs as the TP=1 request and reported
 `weight_version="baseline"`.
 
 Evidence:
@@ -237,9 +250,9 @@ small post-unlock metadata window. Until those changes land, this branch
 guarantees Gateway selection/retry consistency for observed registration
 metadata, not a full distributed transaction against an in-flight update.
 
-Other residual operational risks are stale registration metadata, manual
-labels overriding discovery, and deployments with cross-model routing enabled
-that reuse the same version string. Strict mode rejects `default` but cannot
+Other residual operational risks are stale registration metadata and manual
+labels overriding discovery. Strict selection rejects conflicting model,
+source, or deployment identities even with matching versions, but cannot
 prove that two arbitrary identical strings refer to cryptographically
 identical weights.
 
@@ -255,4 +268,7 @@ afa1376 feat(gateway): add strict PD weight selection
 ef8ccea fix(gateway): pin PD version across retries
 8bb548b fix(gateway): keep bucket selection within filtered workers
 6febf29 chore(repro): add A100 NIXL PD smoke scripts
+10994b7 fix(gateway): complete strict PD identity and legacy selection contract
+51aec90 test(gateway): exercise HTTP discovery through strict PD selection
+fa7f0ba fix(gateway): retain PD selector for production health checks
 ```

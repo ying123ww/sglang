@@ -6,6 +6,21 @@ has a compute process or if a required port is occupied.
 
 Environment: `/storage/data/yingxy2024/envs/sglang-pd-repro`
 
+Run the CPU-only Phase I-a acceptance suite (no GPU reservation):
+
+```bash
+bash scripts/pd_snapshot_repro/check_phase_ia.sh
+```
+
+It records the commit, worktree status, Cargo.lock digest, and test/build results
+in a fresh `.local/logs/phase-ia-*/acceptance.log`. Rust/OpenSSL paths can be
+overridden with `PD_RUST_ENV`, `CARGO_HOME`, `CARGO_TARGET_DIR`, and `OPENSSL_DIR`.
+The existing `slime` path is used only for the Rust/OpenSSL tools, not to launch
+SGLang. To enable the new selection guarantee, build this checkout's Gateway
+and pass `--pd-weight-version-mode strict`. Default `legacy` retains upstream
+selection, including mismatched versions; the installed router wheel below
+does not contain this branch's strict-selection changes.
+
 Run a single server:
 
 ```bash
