@@ -31,6 +31,14 @@ pub(crate) enum WorkerSelectionMode {
     PrefillDecode,
 }
 
+fn weight_version(worker: &Arc<dyn Worker>) -> Option<&str> {
+    worker
+        .metadata()
+        .labels
+        .get("weight_version")
+        .map(String::as_str)
+}
+
 impl WorkerSelectionStage {
     pub fn new(
         worker_registry: Arc<WorkerRegistry>,
@@ -230,6 +238,22 @@ impl WorkerSelectionStage {
             return None;
         }
 
+        // Apply the hard compatibility constraint before invoking the policy. Two
+        // unlabeled workers remain compatible for legacy deployments.
+        let compatible_prefill: Vec<_> = available_prefill
+            .into_iter()
+            .filter(|prefill| {
+                available_decode
+                    .iter()
+                    .any(|decode| weight_version(prefill) == weight_version(decode))
+            })
+            .collect();
+
+        if compatible_prefill.is_empty() {
+            warn!("No weight-version-compatible PD worker pairs");
+            return None;
+        }
+
         // Select using policies
         let policy = match model_id {
             Some(model) => self.policy_registry.get_policy_or_default(model),
@@ -247,8 +271,13 @@ impl WorkerSelectionStage {
             headers,
             hash_ring,
         };
-        let prefill_idx = policy.select_worker(&available_prefill, &info).await?;
-        let decode_idx = policy.select_worker(&available_decode, &info).await?;
+        let prefill_idx = policy.select_worker(&compatible_prefill, &info).await?;
+        let selected_prefill = compatible_prefill[prefill_idx].clone();
+        let compatible_decode: Vec<_> = available_decode
+            .into_iter()
+            .filter(|decode| weight_version(&selected_prefill) == weight_version(decode))
+            .collect();
+        let decode_idx = policy.select_worker(&compatible_decode, &info).await?;
 
         let model = model_id.unwrap_or(UNKNOWN_MODEL_ID);
         let policy_name = policy.name();
@@ -267,10 +296,7 @@ impl WorkerSelectionStage {
             policy_name,
         );
 
-        Some((
-            available_prefill[prefill_idx].clone(),
-            available_decode[decode_idx].clone(),
-        ))
+        Some((selected_prefill, compatible_decode[decode_idx].clone()))
     }
 }
 
@@ -279,40 +305,56 @@ mod tests {
     use super::*;
     use crate::{config::PolicyConfig, core::BasicWorkerBuilder};
 
-    fn stage_with_pd_versions(prefill_version: &str, decode_version: &str) -> WorkerSelectionStage {
+    fn stage_with_pd_version_sets(
+        prefill_versions: &[&str],
+        decode_versions: &[&str],
+    ) -> WorkerSelectionStage {
         let worker_registry = Arc::new(WorkerRegistry::new());
         let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
 
-        // Singleton pools make selection deterministic, without servers or GPU inference.
-        for (url, worker_type, version) in [
-            (
-                "http://prefill:30000",
-                WorkerType::Prefill {
-                    bootstrap_port: Some(8998),
-                },
-                prefill_version,
-            ),
-            ("http://decode:30001", WorkerType::Decode, decode_version),
-        ] {
+        for (index, version) in prefill_versions.iter().enumerate() {
             let worker = Arc::new(
-                BasicWorkerBuilder::new(url)
-                    .worker_type(worker_type)
+                BasicWorkerBuilder::new(format!("http://prefill:{}", 30000 + index * 2))
+                    .worker_type(WorkerType::Prefill {
+                        bootstrap_port: Some(8998),
+                    })
                     .connection_mode(ConnectionMode::Grpc { port: None })
                     .label("model_id", "qwen")
-                    .label("weight_version", version)
+                    .label("weight_version", *version)
                     .build(),
             );
             assert!(worker.is_available());
             worker_registry.register(worker);
             policy_registry.on_worker_added("qwen", None);
         }
-        assert_eq!(worker_registry.get_by_model("qwen").len(), 2);
+
+        for (index, version) in decode_versions.iter().enumerate() {
+            let worker = Arc::new(
+                BasicWorkerBuilder::new(format!("http://decode:{}", 30001 + index * 2))
+                    .worker_type(WorkerType::Decode)
+                    .connection_mode(ConnectionMode::Grpc { port: None })
+                    .label("model_id", "qwen")
+                    .label("weight_version", *version)
+                    .build(),
+            );
+            assert!(worker.is_available());
+            worker_registry.register(worker);
+            policy_registry.on_worker_added("qwen", None);
+        }
+        assert_eq!(
+            worker_registry.get_by_model("qwen").len(),
+            prefill_versions.len() + decode_versions.len()
+        );
 
         WorkerSelectionStage::new(
             worker_registry,
             policy_registry,
             WorkerSelectionMode::PrefillDecode,
         )
+    }
+
+    fn stage_with_pd_versions(prefill_version: &str, decode_version: &str) -> WorkerSelectionStage {
+        stage_with_pd_version_sets(&[prefill_version], &[decode_version])
     }
 
     #[tokio::test]
@@ -348,5 +390,17 @@ mod tests {
             selected_versions, None,
             "no compatible PD pair exists: prefill v10 must not be paired with decode v11"
         );
+    }
+
+    #[tokio::test]
+    async fn test_pd_weight_version_matching_pair_is_found_in_mixed_pool() {
+        let stage = stage_with_pd_version_sets(&["v10", "v11"], &["v11"]);
+        let (prefill, decode) = stage
+            .select_pd_pair(Some("qwen"), None, None, None)
+            .await
+            .expect("the compatible v11 pair must not be hidden by the v10 prefill");
+
+        assert_eq!(prefill.metadata().labels["weight_version"], "v11");
+        assert_eq!(decode.metadata().labels["weight_version"], "v11");
     }
 }
