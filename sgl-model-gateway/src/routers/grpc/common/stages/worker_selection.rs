@@ -303,7 +303,7 @@ impl WorkerSelectionStage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{config::PolicyConfig, core::BasicWorkerBuilder};
+    use crate::{config::PolicyConfig, core::BasicWorkerBuilder, routers::grpc::client::ModelInfo};
 
     fn stage_with_pd_version_sets(
         prefill_versions: &[&str],
@@ -399,6 +399,58 @@ mod tests {
             .select_pd_pair(Some("qwen"), None, None, None)
             .await
             .expect("the compatible v11 pair must not be hidden by the v10 prefill");
+
+        assert_eq!(prefill.metadata().labels["weight_version"], "v11");
+        assert_eq!(decode.metadata().labels["weight_version"], "v11");
+    }
+
+    #[tokio::test]
+    async fn test_pd_weight_version_from_grpc_model_info_reaches_selection() {
+        let labels_from_response = |version: &str| {
+            ModelInfo::Sglang(Box::new(
+                smg_grpc_client::sglang_proto::GetModelInfoResponse {
+                    model_path: "/models/qwen".to_string(),
+                    weight_version: version.to_string(),
+                    ..Default::default()
+                },
+            ))
+            .to_labels()
+        };
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
+
+        let prefill = Arc::new(
+            BasicWorkerBuilder::new("http://prefill:30000")
+                .worker_type(WorkerType::Prefill {
+                    bootstrap_port: Some(8998),
+                })
+                .connection_mode(ConnectionMode::Grpc { port: None })
+                .labels(labels_from_response("v11"))
+                .label("model_id", "qwen")
+                .build(),
+        );
+        let decode = Arc::new(
+            BasicWorkerBuilder::new("http://decode:30001")
+                .worker_type(WorkerType::Decode)
+                .connection_mode(ConnectionMode::Grpc { port: None })
+                .labels(labels_from_response("v11"))
+                .label("model_id", "qwen")
+                .build(),
+        );
+        worker_registry.register(prefill);
+        worker_registry.register(decode);
+        policy_registry.on_worker_added("qwen", None);
+        policy_registry.on_worker_added("qwen", None);
+
+        let stage = WorkerSelectionStage::new(
+            worker_registry,
+            policy_registry,
+            WorkerSelectionMode::PrefillDecode,
+        );
+        let (prefill, decode) = stage
+            .select_pd_pair(Some("qwen"), None, None, None)
+            .await
+            .expect("versions discovered from real gRPC response fields must be selectable");
 
         assert_eq!(prefill.metadata().labels["weight_version"], "v11");
         assert_eq!(decode.metadata().labels["weight_version"], "v11");

@@ -206,3 +206,34 @@ impl ModelInfo {
         labels
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pd_weight_version_is_exposed_as_sglang_model_info_label() {
+        let info = ModelInfo::Sglang(Box::new(
+            smg_grpc_client::sglang_proto::GetModelInfoResponse {
+                model_path: "/models/qwen".to_string(),
+                weight_version: "v11".to_string(),
+                is_generation: true,
+                ..Default::default()
+            },
+        ));
+
+        let labels = info.to_labels();
+        assert_eq!(
+            labels.get("model_path").map(String::as_str),
+            Some("/models/qwen")
+        );
+        assert_eq!(
+            labels.get("weight_version").map(String::as_str),
+            Some("v11")
+        );
+        assert_eq!(
+            labels.get("is_generation").map(String::as_str),
+            Some("true")
+        );
+    }
+}
