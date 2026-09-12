@@ -275,6 +275,18 @@ impl LoadBalancingPolicy for BucketPolicy {
                 }
             };
 
+            let prefill_url = if workers.iter().any(|worker| worker.url() == prefill_url) {
+                prefill_url
+            } else {
+                let idx = rng.random_range(0..healthy_indices.len());
+                let selected_url = workers[healthy_indices[idx]].url().to_string();
+                warn!(
+                    "Bucket selected worker outside the current candidate set; selecting {} instead",
+                    selected_url
+                );
+                selected_url
+            };
+
             {
                 let mut buc = bucket.write().unwrap();
                 buc.post_process_request(char_count, prefill_url.clone());
@@ -590,6 +602,29 @@ impl Bucket {
 mod tests {
     use super::*;
     use crate::core::{BasicWorkerBuilder, WorkerType};
+
+    #[tokio::test]
+    async fn test_filtered_candidate_set_falls_back_to_available_worker() {
+        let policy = BucketPolicy::with_config(BucketConfig::default());
+        let all_workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(BasicWorkerBuilder::new("http://w1:8000").build()),
+            Arc::new(BasicWorkerBuilder::new("http://w2:8000").build()),
+        ];
+        policy.init_prefill_worker_urls(&all_workers);
+
+        let filtered_workers = vec![Arc::clone(&all_workers[1])];
+        let selected = policy
+            .select_worker(
+                &filtered_workers,
+                &SelectWorkerInfo {
+                    request_text: Some("short request"),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        assert_eq!(selected, Some(0));
+    }
 
     #[tokio::test]
     async fn test_load_balancing_conditions() {
