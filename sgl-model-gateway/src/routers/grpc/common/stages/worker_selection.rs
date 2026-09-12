@@ -8,6 +8,7 @@ use tracing::{error, warn};
 
 use super::PipelineStage;
 use crate::{
+    config::PdWeightVersionMode,
     core::{ConnectionMode, Worker, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID},
     observability::metrics::{metrics_labels, Metrics},
     policies::{PolicyRegistry, SelectWorkerInfo},
@@ -22,6 +23,7 @@ pub(crate) struct WorkerSelectionStage {
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
     mode: WorkerSelectionMode,
+    pd_weight_version_mode: PdWeightVersionMode,
 }
 
 pub(crate) enum WorkerSelectionMode {
@@ -49,7 +51,13 @@ impl WorkerSelectionStage {
             worker_registry,
             policy_registry,
             mode,
+            pd_weight_version_mode: PdWeightVersionMode::Legacy,
         }
+    }
+
+    pub fn with_pd_weight_version_mode(mut self, mode: PdWeightVersionMode) -> Self {
+        self.pd_weight_version_mode = mode;
+        self
     }
 }
 
@@ -243,9 +251,10 @@ impl WorkerSelectionStage {
         let compatible_prefill: Vec<_> = available_prefill
             .into_iter()
             .filter(|prefill| {
-                available_decode
-                    .iter()
-                    .any(|decode| weight_version(prefill) == weight_version(decode))
+                available_decode.iter().any(|decode| {
+                    self.pd_weight_version_mode
+                        .compatible(weight_version(prefill), weight_version(decode))
+                })
             })
             .collect();
 
@@ -275,7 +284,10 @@ impl WorkerSelectionStage {
         let selected_prefill = compatible_prefill[prefill_idx].clone();
         let compatible_decode: Vec<_> = available_decode
             .into_iter()
-            .filter(|decode| weight_version(&selected_prefill) == weight_version(decode))
+            .filter(|decode| {
+                self.pd_weight_version_mode
+                    .compatible(weight_version(&selected_prefill), weight_version(decode))
+            })
             .collect();
         let decode_idx = policy.select_worker(&compatible_decode, &info).await?;
 
@@ -355,6 +367,33 @@ mod tests {
 
     fn stage_with_pd_versions(prefill_version: &str, decode_version: &str) -> WorkerSelectionStage {
         stage_with_pd_version_sets(&[prefill_version], &[decode_version])
+    }
+
+    fn stage_with_unlabeled_pd_workers() -> WorkerSelectionStage {
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
+        let prefill = Arc::new(
+            BasicWorkerBuilder::new("http://prefill:30000")
+                .worker_type(WorkerType::Prefill {
+                    bootstrap_port: Some(8998),
+                })
+                .connection_mode(ConnectionMode::Grpc { port: None })
+                .build(),
+        );
+        let decode = Arc::new(
+            BasicWorkerBuilder::new("http://decode:30001")
+                .worker_type(WorkerType::Decode)
+                .connection_mode(ConnectionMode::Grpc { port: None })
+                .build(),
+        );
+        worker_registry.register(prefill);
+        worker_registry.register(decode);
+
+        WorkerSelectionStage::new(
+            worker_registry,
+            policy_registry,
+            WorkerSelectionMode::PrefillDecode,
+        )
     }
 
     #[tokio::test]
@@ -454,5 +493,40 @@ mod tests {
 
         assert_eq!(prefill.metadata().labels["weight_version"], "v11");
         assert_eq!(decode.metadata().labels["weight_version"], "v11");
+    }
+
+    #[tokio::test]
+    async fn test_pd_weight_version_legacy_accepts_two_unlabeled_workers() {
+        assert!(stage_with_unlabeled_pd_workers()
+            .select_pd_pair(None, None, None, None)
+            .await
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn test_pd_weight_version_strict_accepts_explicit_matching_version() {
+        let stage = stage_with_pd_versions("v11", "v11")
+            .with_pd_weight_version_mode(PdWeightVersionMode::Strict);
+        assert!(stage
+            .select_pd_pair(Some("qwen"), None, None, None)
+            .await
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn test_pd_weight_version_strict_rejects_unlabeled_workers() {
+        let stage = stage_with_unlabeled_pd_workers()
+            .with_pd_weight_version_mode(PdWeightVersionMode::Strict);
+        assert!(stage.select_pd_pair(None, None, None, None).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_pd_weight_version_strict_rejects_default_placeholder() {
+        let stage = stage_with_pd_versions("default", "default")
+            .with_pd_weight_version_mode(PdWeightVersionMode::Strict);
+        assert!(stage
+            .select_pd_pair(Some("qwen"), None, None, None)
+            .await
+            .is_none());
     }
 }

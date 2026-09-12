@@ -12,6 +12,30 @@ pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 pub const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 500;
 pub const DEFAULT_TCP_KEEPALIVE_SECS: u64 = 30;
 
+/// How PD routing treats worker weight-version metadata.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PdWeightVersionMode {
+    /// Preserve unlabeled legacy deployments while rejecting known mismatches.
+    #[default]
+    Legacy,
+    /// Require the same explicit version on both workers. The placeholder
+    /// `default` is not an explicit snapshot identity.
+    Strict,
+}
+
+impl PdWeightVersionMode {
+    pub fn compatible(self, prefill: Option<&str>, decode: Option<&str>) -> bool {
+        match self {
+            Self::Legacy => prefill == decode,
+            Self::Strict => matches!(
+                (prefill, decode),
+                (Some(p), Some(d)) if !p.is_empty() && p != "default" && p == d
+            ),
+        }
+    }
+}
+
 /// Main router configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouterConfig {
@@ -59,6 +83,8 @@ pub struct RouterConfig {
     pub health_check: HealthCheckConfig,
     #[serde(default)]
     pub enable_igw: bool,
+    #[serde(default)]
+    pub pd_weight_version_mode: PdWeightVersionMode,
     /// Can be a HuggingFace model ID or local path
     pub model_path: Option<String>,
     /// Overrides model_path tokenizer if provided
@@ -536,6 +562,7 @@ impl Default for RouterConfig {
             disable_circuit_breaker: false,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
+            pd_weight_version_mode: PdWeightVersionMode::Legacy,
             connection_mode: ConnectionMode::Http,
             model_path: None,
             tokenizer_path: None,

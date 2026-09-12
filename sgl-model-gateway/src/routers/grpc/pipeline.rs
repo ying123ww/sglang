@@ -29,6 +29,7 @@ use super::{
     utils::error_type_from_status,
 };
 use crate::{
+    config::PdWeightVersionMode,
     core::{WorkerRegistry, UNKNOWN_MODEL_ID},
     observability::metrics::{bool_to_static_str, metrics_labels, Metrics},
     policies::PolicyRegistry,
@@ -166,6 +167,7 @@ impl RequestPipeline {
         reasoning_parser_factory: ReasoningParserFactory,
         configured_tool_parser: Option<String>,
         configured_reasoning_parser: Option<String>,
+        pd_weight_version_mode: PdWeightVersionMode,
     ) -> Self {
         let processor = processor::ResponseProcessor::new(
             tool_parser_factory.clone(),
@@ -184,11 +186,14 @@ impl RequestPipeline {
 
         let stages: Vec<Box<dyn PipelineStage>> = vec![
             Box::new(PreparationStage::new()),
-            Box::new(WorkerSelectionStage::new(
-                worker_registry,
-                policy_registry,
-                WorkerSelectionMode::PrefillDecode,
-            )),
+            Box::new(
+                WorkerSelectionStage::new(
+                    worker_registry,
+                    policy_registry,
+                    WorkerSelectionMode::PrefillDecode,
+                )
+                .with_pd_weight_version_mode(pd_weight_version_mode),
+            ),
             Box::new(ClientAcquisitionStage),
             Box::new(RequestBuildingStage::new(true)), // Inject PD metadata
             Box::new(DispatchMetadataStage),

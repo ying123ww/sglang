@@ -2,8 +2,8 @@ use smg_mcp::McpConfig;
 
 use super::{
     CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
-    HistoryBackend, MetricsConfig, OracleConfig, PolicyConfig, PostgresConfig, RedisConfig,
-    RetryConfig, RouterConfig, RoutingMode, TokenizerCacheConfig, TraceConfig,
+    HistoryBackend, MetricsConfig, OracleConfig, PdWeightVersionMode, PolicyConfig, PostgresConfig,
+    RedisConfig, RetryConfig, RouterConfig, RoutingMode, TokenizerCacheConfig, TraceConfig,
 };
 use crate::core::ConnectionMode;
 
@@ -88,6 +88,11 @@ impl RouterConfigBuilder {
 
     pub fn mode(mut self, mode: RoutingMode) -> Self {
         self.config.mode = mode;
+        self
+    }
+
+    pub fn pd_weight_version_mode(mut self, mode: PdWeightVersionMode) -> Self {
+        self.config.pd_weight_version_mode = mode;
         self
     }
 

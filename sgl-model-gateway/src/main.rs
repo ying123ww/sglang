@@ -6,10 +6,10 @@ use smg::{
     auth::{ApiKeyEntry, ControlPlaneAuthConfig, JwtConfig, Role},
     config::{
         CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
-        HistoryBackend, ManualAssignmentMode, MetricsConfig, OracleConfig, PolicyConfig,
-        PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingMode, TokenizerCacheConfig,
-        TraceConfig, DEFAULT_CONNECT_TIMEOUT_SECS, DEFAULT_POOL_IDLE_TIMEOUT_SECS,
-        DEFAULT_POOL_MAX_IDLE_PER_HOST, DEFAULT_TCP_KEEPALIVE_SECS,
+        HistoryBackend, ManualAssignmentMode, MetricsConfig, OracleConfig, PdWeightVersionMode,
+        PolicyConfig, PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingMode,
+        TokenizerCacheConfig, TraceConfig, DEFAULT_CONNECT_TIMEOUT_SECS,
+        DEFAULT_POOL_IDLE_TIMEOUT_SECS, DEFAULT_POOL_MAX_IDLE_PER_HOST, DEFAULT_TCP_KEEPALIVE_SECS,
     },
     core::ConnectionMode,
     observability::{
@@ -210,6 +210,11 @@ struct CliArgs {
     /// Specific policy for decode nodes in PD mode
     #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual"], help_heading = "PD Disaggregation")]
     decode_policy: Option<String>,
+
+    /// Weight-version selection safety: legacy permits two unlabeled workers;
+    /// strict requires the same explicit, non-default version on both sides.
+    #[arg(long, default_value = "legacy", value_parser = ["legacy", "strict"], help_heading = "PD Disaggregation")]
+    pd_weight_version_mode: String,
 
     /// Timeout in seconds for worker startup and registration
     #[arg(long, default_value_t = 1800, help_heading = "PD Disaggregation")]
@@ -926,6 +931,10 @@ impl CliArgs {
         };
 
         let policy = self.parse_policy(&self.policy);
+        let pd_weight_version_mode = match self.pd_weight_version_mode.as_str() {
+            "strict" => PdWeightVersionMode::Strict,
+            _ => PdWeightVersionMode::Legacy,
+        };
 
         let discovery = if self.service_discovery {
             Some(DiscoveryConfig {
@@ -1002,6 +1011,7 @@ impl CliArgs {
 
         let builder = RouterConfig::builder()
             .mode(mode)
+            .pd_weight_version_mode(pd_weight_version_mode)
             .policy(policy)
             .connection_mode(connection_mode)
             .host(&self.host)

@@ -62,6 +62,7 @@ impl GrpcPDRouter {
             reasoning_parser_factory.clone(),
             ctx.configured_tool_parser.clone(),
             ctx.configured_reasoning_parser.clone(),
+            ctx.router_config.pd_weight_version_mode,
         );
 
         Ok(GrpcPDRouter {
