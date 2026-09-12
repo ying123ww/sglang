@@ -1,4 +1,8 @@
-use std::{borrow::Cow, sync::Arc, time::Instant};
+use std::{
+    borrow::Cow,
+    sync::{Arc, OnceLock},
+    time::Instant,
+};
 
 use async_trait::async_trait;
 use axum::{
@@ -75,6 +79,7 @@ struct PDRequestContext<'a> {
     request_text: Option<String>,
     model_id: Option<&'a str>,
     headers: Option<HeaderMap>,
+    bound_weight_version: Arc<OnceLock<Option<String>>>,
 }
 
 /// Marker placed on a `Response` by paths inside
@@ -401,10 +406,11 @@ impl PDRouter {
                     let context = context.clone();
                     async move {
                         let (prefill, decode) = match self
-                            .select_pd_pair(
+                            .select_pd_pair_with_bound(
                                 context.request_text.as_deref(),
                                 context.model_id,
                                 context.headers.as_ref(),
+                                Some(&context.bound_weight_version),
                             )
                             .await
                         {
@@ -983,6 +989,17 @@ impl PDRouter {
         model_id: Option<&str>,
         headers: Option<&HeaderMap>,
     ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>), String> {
+        self.select_pd_pair_with_bound(request_text, model_id, headers, None)
+            .await
+    }
+
+    async fn select_pd_pair_with_bound(
+        &self,
+        request_text: Option<&str>,
+        model_id: Option<&str>,
+        headers: Option<&HeaderMap>,
+        bound_weight_version: Option<&OnceLock<Option<String>>>,
+    ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>), String> {
         let effective_model_id = if !self.enable_igw { None } else { model_id };
 
         debug!(
@@ -1012,13 +1029,25 @@ impl PDRouter {
             self.worker_registry.get_decode_workers()
         };
 
+        let matches_bound_version =
+            |worker: &Arc<dyn Worker>| match bound_weight_version.and_then(OnceLock::get) {
+                Some(bound) => {
+                    worker
+                        .metadata()
+                        .labels
+                        .get("weight_version")
+                        .map(String::as_str)
+                        == bound.as_deref()
+                }
+                None => true,
+            };
         let available_prefill: Vec<_> = prefill_workers
             .into_iter()
-            .filter(|worker| worker.is_available())
+            .filter(|worker| worker.is_available() && matches_bound_version(worker))
             .collect();
         let available_decode: Vec<_> = decode_workers
             .into_iter()
-            .filter(|worker| worker.is_available())
+            .filter(|worker| worker.is_available() && matches_bound_version(worker))
             .collect();
         let compatible_prefill: Vec<_> = available_prefill
             .into_iter()
@@ -1091,6 +1120,20 @@ impl PDRouter {
             "decode",
         )
         .await?;
+
+        if let Some(bound) = bound_weight_version {
+            let selected_version = prefill.metadata().labels.get("weight_version").cloned();
+            if bound.set(selected_version).is_err() {
+                debug_assert_eq!(
+                    bound.get().and_then(Option::as_deref),
+                    prefill
+                        .metadata()
+                        .labels
+                        .get("weight_version")
+                        .map(String::as_str)
+                );
+            }
+        }
 
         // Record worker selection metrics (Layer 3)
         let model = model_id.unwrap_or(UNKNOWN_MODEL_ID);
@@ -1644,6 +1687,7 @@ impl RouterTrait for PDRouter {
             request_text,
             model_id,
             headers: headers.cloned(),
+            bound_weight_version: Arc::new(OnceLock::new()),
         };
 
         self.execute_dual_dispatch(headers, body, context).await
@@ -1675,6 +1719,7 @@ impl RouterTrait for PDRouter {
             request_text,
             model_id,
             headers: headers.cloned(),
+            bound_weight_version: Arc::new(OnceLock::new()),
         };
 
         self.execute_dual_dispatch(headers, body, context).await
@@ -1709,6 +1754,7 @@ impl RouterTrait for PDRouter {
             request_text,
             model_id,
             headers: headers.cloned(),
+            bound_weight_version: Arc::new(OnceLock::new()),
         };
 
         self.execute_dual_dispatch(headers, body, context).await
@@ -1779,6 +1825,7 @@ impl RouterTrait for PDRouter {
             request_text: req_text,
             model_id,
             headers: headers.cloned(),
+            bound_weight_version: Arc::new(OnceLock::new()),
         };
 
         self.execute_dual_dispatch(headers, body, context).await
@@ -2039,6 +2086,51 @@ mod tests {
         );
 
         assert!(router.select_pd_pair(None, None, None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_pd_weight_version_http_retry_cannot_drift_to_new_version() {
+        let bound = OnceLock::new();
+        let first_attempt = create_test_pd_router();
+        register_versioned_worker(
+            &first_attempt,
+            "http://v10-prefill",
+            WorkerType::Prefill {
+                bootstrap_port: Some(8998),
+            },
+            Some("v10"),
+        );
+        register_versioned_worker(
+            &first_attempt,
+            "http://v10-decode",
+            WorkerType::Decode,
+            Some("v10"),
+        );
+        assert!(first_attempt
+            .select_pd_pair_with_bound(None, None, None, Some(&bound))
+            .await
+            .is_ok());
+        assert_eq!(bound.get().and_then(Option::as_deref), Some("v10"));
+
+        let new_version_only = create_test_pd_router();
+        register_versioned_worker(
+            &new_version_only,
+            "http://v11-prefill",
+            WorkerType::Prefill {
+                bootstrap_port: Some(8998),
+            },
+            Some("v11"),
+        );
+        register_versioned_worker(
+            &new_version_only,
+            "http://v11-decode",
+            WorkerType::Decode,
+            Some("v11"),
+        );
+        assert!(new_version_only
+            .select_pd_pair_with_bound(None, None, None, Some(&bound))
+            .await
+            .is_err());
     }
 
     #[test]

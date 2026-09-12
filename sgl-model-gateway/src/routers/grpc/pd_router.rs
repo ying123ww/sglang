@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use axum::{http::HeaderMap, response::Response};
@@ -90,6 +90,7 @@ impl GrpcPDRouter {
         let headers_cloned = headers.cloned();
         let model_id_cloned = model_id.map(|s| s.to_string());
         let components = self.shared_components.clone();
+        let bound_weight_version = Arc::new(OnceLock::new());
         let pipeline = &self.pipeline;
 
         RetryExecutor::execute_response_with_retry(
@@ -99,9 +100,16 @@ impl GrpcPDRouter {
                 let headers = headers_cloned.clone();
                 let model_id = model_id_cloned.clone();
                 let components = Arc::clone(&components);
+                let bound_weight_version = Arc::clone(&bound_weight_version);
                 async move {
                     pipeline
-                        .execute_generate(request, headers, model_id, components)
+                        .execute_generate_with_pd_weight_version(
+                            request,
+                            headers,
+                            model_id,
+                            components,
+                            bound_weight_version,
+                        )
                         .await
                 }
             },
@@ -148,6 +156,7 @@ impl GrpcPDRouter {
         let headers_cloned = headers.cloned();
         let model_id_cloned = model_id.map(|s| s.to_string());
         let components = self.shared_components.clone();
+        let bound_weight_version = Arc::new(OnceLock::new());
         let pipeline = &self.pipeline;
 
         RetryExecutor::execute_response_with_retry(
@@ -157,9 +166,16 @@ impl GrpcPDRouter {
                 let headers = headers_cloned.clone();
                 let model_id = model_id_cloned.clone();
                 let components = Arc::clone(&components);
+                let bound_weight_version = Arc::clone(&bound_weight_version);
                 async move {
                     pipeline
-                        .execute_chat(request, headers, model_id, components)
+                        .execute_chat_with_pd_weight_version(
+                            request,
+                            headers,
+                            model_id,
+                            components,
+                            bound_weight_version,
+                        )
                         .await
                 }
             },

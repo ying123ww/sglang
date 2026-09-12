@@ -4,7 +4,7 @@
 //! eliminating deep parameter passing chains and providing a single source of truth
 //! for request state.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use axum::http::HeaderMap;
 
@@ -66,6 +66,10 @@ pub(crate) struct SharedComponents {
 /// Mutable processing state (evolves through pipeline stages)
 #[derive(Default)]
 pub(crate) struct ProcessingState {
+    /// Shared by all attempts of one logical PD request. Once the first pair is
+    /// selected, retries may change workers but not the weight version.
+    pub bound_pd_weight_version: Option<Arc<OnceLock<Option<String>>>>,
+
     // Stage 1: Preparation outputs
     pub preparation: Option<PreparationOutput>,
 

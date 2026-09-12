@@ -3,7 +3,10 @@
 //! This module defines the RequestPipeline orchestrator that coordinates
 //! the execution of pipeline stages from request preparation to response delivery.
 
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::{Arc, OnceLock},
+    time::Instant,
+};
 
 use axum::response::{IntoResponse, Response};
 use tracing::{debug, error};
@@ -268,6 +271,36 @@ impl RequestPipeline {
         model_id: Option<String>,
         components: Arc<SharedComponents>,
     ) -> Response {
+        self.execute_chat_inner(request, headers, model_id, components, None)
+            .await
+    }
+
+    pub async fn execute_chat_with_pd_weight_version(
+        &self,
+        request: Arc<ChatCompletionRequest>,
+        headers: Option<http::HeaderMap>,
+        model_id: Option<String>,
+        components: Arc<SharedComponents>,
+        bound_weight_version: Arc<OnceLock<Option<String>>>,
+    ) -> Response {
+        self.execute_chat_inner(
+            request,
+            headers,
+            model_id,
+            components,
+            Some(bound_weight_version),
+        )
+        .await
+    }
+
+    async fn execute_chat_inner(
+        &self,
+        request: Arc<ChatCompletionRequest>,
+        headers: Option<http::HeaderMap>,
+        model_id: Option<String>,
+        components: Arc<SharedComponents>,
+        bound_weight_version: Option<Arc<OnceLock<Option<String>>>>,
+    ) -> Response {
         let start = Instant::now();
         // Clone Arc for metrics (cheap atomic increment) to avoid borrow issues
         let request_for_metrics = Arc::clone(&request);
@@ -284,6 +317,7 @@ impl RequestPipeline {
         );
 
         let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
+        ctx.state.bound_pd_weight_version = bound_weight_version;
 
         for stage in self.stages.iter() {
             match stage.execute(&mut ctx).await {
@@ -374,6 +408,36 @@ impl RequestPipeline {
         model_id: Option<String>,
         components: Arc<SharedComponents>,
     ) -> Response {
+        self.execute_generate_inner(request, headers, model_id, components, None)
+            .await
+    }
+
+    pub async fn execute_generate_with_pd_weight_version(
+        &self,
+        request: Arc<GenerateRequest>,
+        headers: Option<http::HeaderMap>,
+        model_id: Option<String>,
+        components: Arc<SharedComponents>,
+        bound_weight_version: Arc<OnceLock<Option<String>>>,
+    ) -> Response {
+        self.execute_generate_inner(
+            request,
+            headers,
+            model_id,
+            components,
+            Some(bound_weight_version),
+        )
+        .await
+    }
+
+    async fn execute_generate_inner(
+        &self,
+        request: Arc<GenerateRequest>,
+        headers: Option<http::HeaderMap>,
+        model_id: Option<String>,
+        components: Arc<SharedComponents>,
+        bound_weight_version: Option<Arc<OnceLock<Option<String>>>>,
+    ) -> Response {
         let start = Instant::now();
         let streaming = request.stream;
 
@@ -388,6 +452,7 @@ impl RequestPipeline {
         );
 
         let mut ctx = RequestContext::for_generate(request, headers, model_id.clone(), components);
+        ctx.state.bound_pd_weight_version = bound_weight_version;
 
         for stage in self.stages.iter() {
             match stage.execute(&mut ctx).await {

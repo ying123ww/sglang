@@ -1,6 +1,6 @@
 //! Worker selection stage: Select appropriate worker(s) based on routing mode
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use axum::response::Response;
@@ -116,7 +116,13 @@ impl PipelineStage for WorkerSelectionStage {
             }
             WorkerSelectionMode::PrefillDecode => {
                 match self
-                    .select_pd_pair(ctx.input.model_id.as_deref(), text, tokens, headers)
+                    .select_pd_pair_with_bound(
+                        ctx.input.model_id.as_deref(),
+                        text,
+                        tokens,
+                        headers,
+                        ctx.state.bound_pd_weight_version.as_deref(),
+                    )
                     .await
                 {
                     Some((prefill, decode)) => WorkerSelection::Dual { prefill, decode },
@@ -207,12 +213,25 @@ impl WorkerSelectionStage {
         Some(selected)
     }
 
+    #[cfg(test)]
     async fn select_pd_pair(
         &self,
         model_id: Option<&str>,
         text: Option<&str>,
         tokens: Option<&[u32]>,
         headers: Option<&http::HeaderMap>,
+    ) -> Option<(Arc<dyn Worker>, Arc<dyn Worker>)> {
+        self.select_pd_pair_with_bound(model_id, text, tokens, headers, None)
+            .await
+    }
+
+    async fn select_pd_pair_with_bound(
+        &self,
+        model_id: Option<&str>,
+        text: Option<&str>,
+        tokens: Option<&[u32]>,
+        headers: Option<&http::HeaderMap>,
+        bound_weight_version: Option<&OnceLock<Option<String>>>,
     ) -> Option<(Arc<dyn Worker>, Arc<dyn Worker>)> {
         let all_workers = self.worker_registry.get_workers_filtered(
             model_id,
@@ -235,6 +254,20 @@ impl WorkerSelectionStage {
                     }
                     acc
                 });
+
+        let matches_bound_version =
+            |worker: &Arc<dyn Worker>| match bound_weight_version.and_then(OnceLock::get) {
+                Some(bound) => weight_version(worker) == bound.as_deref(),
+                None => true,
+            };
+        let available_prefill: Vec<_> = available_prefill
+            .into_iter()
+            .filter(&matches_bound_version)
+            .collect();
+        let available_decode: Vec<_> = available_decode
+            .into_iter()
+            .filter(&matches_bound_version)
+            .collect();
 
         if available_prefill.is_empty() {
             warn!("No available prefill workers");
@@ -308,7 +341,18 @@ impl WorkerSelectionStage {
             policy_name,
         );
 
-        Some((selected_prefill, compatible_decode[decode_idx].clone()))
+        let selected_decode = compatible_decode[decode_idx].clone();
+        if let Some(bound) = bound_weight_version {
+            let selected_version = weight_version(&selected_prefill).map(str::to_string);
+            if bound.set(selected_version).is_err() {
+                debug_assert_eq!(
+                    bound.get().and_then(Option::as_deref),
+                    weight_version(&selected_prefill)
+                );
+            }
+        }
+
+        Some((selected_prefill, selected_decode))
     }
 }
 
@@ -528,5 +572,28 @@ mod tests {
             .select_pd_pair(Some("qwen"), None, None, None)
             .await
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn test_pd_weight_version_retry_cannot_drift_to_new_version() {
+        let bound = OnceLock::new();
+        let first_attempt = stage_with_pd_versions("v10", "v10");
+        assert!(first_attempt
+            .select_pd_pair_with_bound(Some("qwen"), None, None, None, Some(&bound))
+            .await
+            .is_some());
+        assert_eq!(bound.get().and_then(Option::as_deref), Some("v10"));
+
+        let new_version_only = stage_with_pd_versions("v11", "v11");
+        assert!(new_version_only
+            .select_pd_pair_with_bound(Some("qwen"), None, None, None, Some(&bound))
+            .await
+            .is_none());
+
+        let replacement_same_version = stage_with_pd_versions("v10", "v10");
+        assert!(replacement_same_version
+            .select_pd_pair_with_bound(Some("qwen"), None, None, None, Some(&bound))
+            .await
+            .is_some());
     }
 }
