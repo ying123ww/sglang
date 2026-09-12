@@ -273,3 +273,80 @@ impl WorkerSelectionStage {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{config::PolicyConfig, core::BasicWorkerBuilder};
+
+    fn stage_with_pd_versions(prefill_version: &str, decode_version: &str) -> WorkerSelectionStage {
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
+
+        // Singleton pools make selection deterministic, without servers or GPU inference.
+        for (url, worker_type, version) in [
+            (
+                "http://prefill:30000",
+                WorkerType::Prefill {
+                    bootstrap_port: Some(8998),
+                },
+                prefill_version,
+            ),
+            ("http://decode:30001", WorkerType::Decode, decode_version),
+        ] {
+            let worker = Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .worker_type(worker_type)
+                    .connection_mode(ConnectionMode::Grpc { port: None })
+                    .label("model_id", "qwen")
+                    .label("weight_version", version)
+                    .build(),
+            );
+            assert!(worker.is_available());
+            worker_registry.register(worker);
+            policy_registry.on_worker_added("qwen", None);
+        }
+        assert_eq!(worker_registry.get_by_model("qwen").len(), 2);
+
+        WorkerSelectionStage::new(
+            worker_registry,
+            policy_registry,
+            WorkerSelectionMode::PrefillDecode,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_pd_weight_version_matching_pair_is_selected() {
+        let stage = stage_with_pd_versions("v11", "v11");
+        let (prefill, decode) = stage
+            .select_pd_pair(Some("qwen"), None, None, None)
+            .await
+            .expect("a healthy same-version PD pair should be selectable");
+
+        assert_eq!(prefill.url(), "http://prefill:30000");
+        assert_eq!(decode.url(), "http://decode:30001");
+        assert_eq!(prefill.metadata().labels["weight_version"], "v11");
+        assert_eq!(decode.metadata().labels["weight_version"], "v11");
+    }
+
+    // Intentionally red until selection enforces PD weight-version compatibility.
+    // This checks admission only; it does not exercise KV transfer or decode.
+    #[tokio::test]
+    async fn test_pd_weight_version_mismatched_pair_is_rejected() {
+        let stage = stage_with_pd_versions("v10", "v11");
+        let selected_versions = stage
+            .select_pd_pair(Some("qwen"), None, None, None)
+            .await
+            .map(|(prefill, decode)| {
+                (
+                    prefill.metadata().labels["weight_version"].clone(),
+                    decode.metadata().labels["weight_version"].clone(),
+                )
+            });
+
+        assert_eq!(
+            selected_versions, None,
+            "no compatible PD pair exists: prefill v10 must not be paired with decode v11"
+        );
+    }
+}
