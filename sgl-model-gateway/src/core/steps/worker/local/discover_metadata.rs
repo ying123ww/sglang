@@ -53,8 +53,26 @@ pub struct ModelInfo {
     pub served_model_name: Option<String>,
     pub tokenizer_path: Option<String>,
     pub is_generation: Option<bool>,
+    pub weight_version: Option<String>,
     pub model_type: Option<String>,
     pub architectures: Option<Vec<String>>,
+}
+
+fn insert_model_info_labels(labels: &mut HashMap<String, String>, model_info: ModelInfo) {
+    if let Some(tokenizer_path) = model_info.tokenizer_path.filter(|s| !s.is_empty()) {
+        labels.insert("tokenizer_path".to_string(), tokenizer_path);
+    }
+    if let Some(weight_version) = model_info.weight_version.filter(|s| !s.is_empty()) {
+        labels.insert("weight_version".to_string(), weight_version);
+    }
+    if let Some(model_type) = model_info.model_type.filter(|s| !s.is_empty()) {
+        labels.insert("model_type".to_string(), model_type);
+    }
+    if let Some(architectures) = model_info.architectures.filter(|a| !a.is_empty()) {
+        if let Ok(json_str) = serde_json::to_string(&architectures) {
+            labels.insert("architectures".to_string(), json_str);
+        }
+    }
 }
 
 /// Fallback function to GET JSON from old endpoint (with "get_" prefix) for backward compatibility.
@@ -345,6 +363,11 @@ impl StepExecutor<LocalWorkerWorkflowData> for DiscoverMetadataStep {
                     {
                         labels.insert("tokenizer_path".to_string(), tokenizer_path);
                     }
+                    if let Some(weight_version) =
+                        model_info.weight_version.filter(|s| !s.is_empty())
+                    {
+                        labels.insert("weight_version".to_string(), weight_version);
+                    }
                     if let Some(model_type) = model_info.model_type.filter(|s| !s.is_empty()) {
                         labels.insert("model_type".to_string(), model_type);
                     }
@@ -398,5 +421,31 @@ impl StepExecutor<LocalWorkerWorkflowData> for DiscoverMetadataStep {
 
     fn is_retryable(&self, _error: &WorkflowError) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pd_weight_version_is_discovered_from_http_model_info() {
+        let model_info: ModelInfo = serde_json::from_value(serde_json::json!({
+            "model_path": "/models/qwen",
+            "tokenizer_path": "/models/qwen",
+            "is_generation": true,
+            "weight_version": "v11",
+            "model_type": "qwen3",
+            "architectures": ["Qwen3ForCausalLM"]
+        }))
+        .expect("valid SGLang /model_info response");
+        let mut labels = HashMap::new();
+
+        insert_model_info_labels(&mut labels, model_info);
+
+        assert_eq!(
+            labels.get("weight_version").map(String::as_str),
+            Some("v11")
+        );
     }
 }

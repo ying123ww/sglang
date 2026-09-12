@@ -20,7 +20,7 @@ use tracing::{debug, error, warn};
 
 use super::pd_types::api_path;
 use crate::{
-    config::types::RetryConfig,
+    config::types::{PdWeightVersionMode, RetryConfig},
     core::{
         is_retryable_status, HashRing, RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry,
         WorkerType, UNKNOWN_MODEL_ID,
@@ -58,6 +58,7 @@ pub struct PDRouter {
     pub retry_config: RetryConfig,
     pub api_key: Option<String>,
     pub enable_igw: bool,
+    pub pd_weight_version_mode: PdWeightVersionMode,
 }
 
 struct PreparedWorkerRequest<'a> {
@@ -189,6 +190,7 @@ impl PDRouter {
             retry_config: ctx.router_config.effective_retry_config(),
             api_key: ctx.router_config.api_key.clone(),
             enable_igw: ctx.router_config.enable_igw,
+            pd_weight_version_mode: ctx.router_config.pd_weight_version_mode,
         })
     }
 
@@ -1010,6 +1012,41 @@ impl PDRouter {
             self.worker_registry.get_decode_workers()
         };
 
+        let available_prefill: Vec<_> = prefill_workers
+            .into_iter()
+            .filter(|worker| worker.is_available())
+            .collect();
+        let available_decode: Vec<_> = decode_workers
+            .into_iter()
+            .filter(|worker| worker.is_available())
+            .collect();
+        let compatible_prefill: Vec<_> = available_prefill
+            .into_iter()
+            .filter(|prefill| {
+                available_decode.iter().any(|decode| {
+                    self.pd_weight_version_mode.compatible(
+                        prefill
+                            .metadata()
+                            .labels
+                            .get("weight_version")
+                            .map(String::as_str),
+                        decode
+                            .metadata()
+                            .labels
+                            .get("weight_version")
+                            .map(String::as_str),
+                    )
+                })
+            })
+            .collect();
+
+        if compatible_prefill.is_empty() && !available_decode.is_empty() {
+            return Err(format!(
+                "No weight-version-compatible PD pair in {:?} mode",
+                self.pd_weight_version_mode
+            ));
+        }
+
         let prefill_policy = self.policy_registry.get_prefill_policy();
         let decode_policy = self.policy_registry.get_decode_policy();
 
@@ -1019,7 +1056,7 @@ impl PDRouter {
             .get_hash_ring(effective_model_id.unwrap_or(UNKNOWN_MODEL_ID));
 
         let prefill = Self::pick_worker_by_policy_arc(
-            &prefill_workers,
+            &compatible_prefill,
             &*prefill_policy,
             request_text,
             headers,
@@ -1028,8 +1065,25 @@ impl PDRouter {
         )
         .await?;
 
+        let compatible_decode: Vec<_> = available_decode
+            .into_iter()
+            .filter(|decode| {
+                self.pd_weight_version_mode.compatible(
+                    prefill
+                        .metadata()
+                        .labels
+                        .get("weight_version")
+                        .map(String::as_str),
+                    decode
+                        .metadata()
+                        .labels
+                        .get("weight_version")
+                        .map(String::as_str),
+                )
+            })
+            .collect();
         let decode = Self::pick_worker_by_policy_arc(
-            &decode_workers,
+            &compatible_decode,
             &*decode_policy,
             request_text,
             headers,
@@ -1780,6 +1834,7 @@ mod tests {
             retry_config: RetryConfig::default(),
             api_key: Some("test_api_key".to_string()),
             enable_igw: false,
+            pd_weight_version_mode: PdWeightVersionMode::Legacy,
         }
     }
 
@@ -1789,6 +1844,21 @@ mod tests {
             .build();
         worker.set_healthy(healthy);
         Box::new(worker)
+    }
+
+    fn register_versioned_worker(
+        router: &PDRouter,
+        url: &str,
+        worker_type: WorkerType,
+        version: Option<&str>,
+    ) {
+        let mut builder = BasicWorkerBuilder::new(url).worker_type(worker_type);
+        if let Some(version) = version {
+            builder = builder.label("weight_version", version);
+        }
+        let worker = Arc::new(builder.build());
+        worker.set_healthy(true);
+        router.worker_registry.register(worker);
     }
 
     #[test]
@@ -1882,6 +1952,93 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("No prefill workers available"));
+    }
+
+    #[tokio::test]
+    async fn test_pd_weight_version_http_matching_pair_is_selected() {
+        let router = create_test_pd_router();
+        register_versioned_worker(
+            &router,
+            "http://prefill",
+            WorkerType::Prefill {
+                bootstrap_port: Some(8998),
+            },
+            Some("v11"),
+        );
+        register_versioned_worker(&router, "http://decode", WorkerType::Decode, Some("v11"));
+
+        let (prefill, decode) = router
+            .select_pd_pair(None, None, None)
+            .await
+            .expect("matching HTTP PD pair should be selected");
+        assert_eq!(prefill.metadata().labels["weight_version"], "v11");
+        assert_eq!(decode.metadata().labels["weight_version"], "v11");
+    }
+
+    #[tokio::test]
+    async fn test_pd_weight_version_http_mismatch_is_rejected() {
+        let router = create_test_pd_router();
+        register_versioned_worker(
+            &router,
+            "http://prefill",
+            WorkerType::Prefill {
+                bootstrap_port: Some(8998),
+            },
+            Some("v10"),
+        );
+        register_versioned_worker(&router, "http://decode", WorkerType::Decode, Some("v11"));
+
+        assert!(router.select_pd_pair(None, None, None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_pd_weight_version_http_finds_match_in_mixed_pool() {
+        let router = create_test_pd_router();
+        for version in ["v10", "v11"] {
+            register_versioned_worker(
+                &router,
+                &format!("http://prefill-{version}"),
+                WorkerType::Prefill {
+                    bootstrap_port: Some(8998),
+                },
+                Some(version),
+            );
+        }
+        register_versioned_worker(
+            &router,
+            "http://decode-v11",
+            WorkerType::Decode,
+            Some("v11"),
+        );
+
+        let (prefill, decode) = router
+            .select_pd_pair(None, None, None)
+            .await
+            .expect("compatible pair should remain visible to policies");
+        assert_eq!(prefill.metadata().labels["weight_version"], "v11");
+        assert_eq!(decode.metadata().labels["weight_version"], "v11");
+    }
+
+    #[tokio::test]
+    async fn test_pd_weight_version_http_strict_rejects_default() {
+        let mut router = create_test_pd_router();
+        router.pd_weight_version_mode = PdWeightVersionMode::Strict;
+        register_versioned_worker(
+            &router,
+            "http://prefill",
+            WorkerType::Prefill {
+                bootstrap_port: Some(8998),
+            },
+            Some("default"),
+        );
+        register_versioned_worker(
+            &router,
+            "http://decode",
+            WorkerType::Decode,
+            Some("default"),
+        );
+
+        assert!(router.select_pd_pair(None, None, None).await.is_err());
     }
 
     #[test]
