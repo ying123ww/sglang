@@ -427,6 +427,128 @@ impl StepExecutor<LocalWorkerWorkflowData> for DiscoverMetadataStep {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        app_context::AppContext,
+        config::{PdWeightVersionMode, PolicyConfig, RouterConfig},
+        core::steps::worker::{
+            local::CreateLocalWorkerStep,
+            shared::{ActivateWorkersStep, RegisterWorkersStep, UpdatePoliciesStep},
+        },
+        routers::http::pd_router::PDRouter,
+    };
+    use axum::{routing::get, Json, Router};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    struct MetadataServer {
+        url: String,
+        hits: Arc<AtomicUsize>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for MetadataServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    async fn metadata_server(body: Value, deprecated: bool) -> MetadataServer {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let app = Router::new()
+            .route("/server_info", get(|| async {
+                Json(serde_json::json!({"served_model_name": "qwen", "model_path": "/models/qwen", "tp_size": 1, "dp_size": 1}))
+            }))
+            .route(if deprecated { "/get_model_info" } else { "/model_info" }, get(move || {
+                let body = body.clone();
+                counter.fetch_add(1, Ordering::SeqCst);
+                async move { Json(body) }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        MetadataServer { url, hits, task }
+    }
+
+    async fn discover_and_register(app: &Arc<AppContext>, server: &MetadataServer, role: &str) {
+        let config =
+            serde_json::from_value(serde_json::json!({"url": server.url, "worker_type": role}))
+                .unwrap();
+        let data = LocalWorkerWorkflowData {
+            config,
+            connection_mode: Some(ConnectionMode::Http),
+            discovered_labels: HashMap::new(),
+            dp_info: None,
+            workers: None,
+            final_labels: HashMap::new(),
+            detected_runtime_type: None,
+            app_context: Some(app.clone()),
+            actual_workers: None,
+        };
+        let mut context = WorkflowContext::new(wfaas::WorkflowInstanceId::new(), data);
+        assert!(matches!(
+            DiscoverMetadataStep.execute(&mut context).await.unwrap(),
+            StepResult::Success
+        ));
+        assert_eq!(
+            server.hits.load(Ordering::SeqCst),
+            1,
+            "production discovery must fetch the HTTP endpoint"
+        );
+        CreateLocalWorkerStep.execute(&mut context).await.unwrap();
+        RegisterWorkersStep.execute(&mut context).await.unwrap();
+        UpdatePoliciesStep.execute(&mut context).await.unwrap();
+        ActivateWorkersStep.execute(&mut context).await.unwrap();
+        let worker = app.worker_registry.get_by_url(&server.url).unwrap();
+        assert_eq!(worker.model_id(), "qwen");
+        assert_eq!(
+            worker.metadata().labels.get("weight_version"),
+            context.data.discovered_labels.get("weight_version")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pd_weight_version_http_endpoint_discovery_registration_selection() {
+        for deprecated in [false, true] {
+            for (body, expected) in [
+                (serde_json::json!({"weight_version": "v11"}), true),
+                (serde_json::json!({"weight_version": "v10"}), false),
+                (serde_json::json!({}), false),
+                (serde_json::json!({"weight_version": null}), false),
+                (serde_json::json!({"weight_version": ""}), false),
+                (serde_json::json!({"weight_version": "default"}), false),
+            ] {
+                let config = RouterConfig {
+                    pd_weight_version_mode: PdWeightVersionMode::Strict,
+                    policy: PolicyConfig::RoundRobin,
+                    ..RouterConfig::default()
+                };
+                let app = Arc::new(AppContext::from_config(config, 10).await.unwrap());
+                let p =
+                    metadata_server(serde_json::json!({"weight_version": "v11"}), deprecated).await;
+                let d = metadata_server(body.clone(), deprecated).await;
+                discover_and_register(&app, &p, "prefill").await;
+                discover_and_register(&app, &d, "decode").await;
+                let router = PDRouter::new(&app).await.unwrap();
+                let selected = router.select_pd_pair(None, Some("qwen"), None).await;
+                assert_eq!(
+                    selected.is_ok(),
+                    expected,
+                    "deprecated={deprecated}, body={body}"
+                );
+                if let Ok((p_worker, d_worker)) = selected {
+                    assert_eq!(p_worker.url(), p.url);
+                    assert_eq!(d_worker.url(), d.url);
+                    assert_eq!(p_worker.metadata().labels["weight_version"], "v11");
+                    assert_eq!(d_worker.metadata().labels["weight_version"], "v11");
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_pd_weight_version_is_discovered_from_http_model_info() {

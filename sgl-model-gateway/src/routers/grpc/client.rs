@@ -235,5 +235,11 @@ mod tests {
             labels.get("is_generation").map(String::as_str),
             Some("true")
         );
+
+        let missing = ModelInfo::Sglang(Box::new(
+            smg_grpc_client::sglang_proto::GetModelInfoResponse::default(),
+        ))
+        .to_labels();
+        assert!(!missing.contains_key("weight_version"));
     }
 }
