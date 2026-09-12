@@ -211,8 +211,8 @@ struct CliArgs {
     #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual"], help_heading = "PD Disaggregation")]
     decode_policy: Option<String>,
 
-    /// Weight-version selection safety: legacy permits two unlabeled workers;
-    /// strict requires the same explicit, non-default version on both sides.
+    /// PD selection: legacy preserves original routing without version checks;
+    /// strict requires matching model identities and explicit, non-default versions.
     #[arg(long, default_value = "legacy", value_parser = ["legacy", "strict"], help_heading = "PD Disaggregation")]
     pd_weight_version_mode: String,
 

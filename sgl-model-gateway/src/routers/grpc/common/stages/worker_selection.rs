@@ -41,6 +41,20 @@ fn weight_version(worker: &Arc<dyn Worker>) -> Option<&str> {
         .map(String::as_str)
 }
 
+fn pd_model_identity(worker: &Arc<dyn Worker>) -> Option<(&str, Option<&str>, Option<&str>)> {
+    let model = worker.model_id();
+    if model.trim().is_empty() || model == UNKNOWN_MODEL_ID || model == "default" {
+        return None;
+    }
+    let labels = &worker.metadata().labels;
+    let path = labels.get("model_path").map(String::as_str);
+    let scope = labels.get("deployment_scope").map(String::as_str);
+    if path.is_some_and(|s| s.trim().is_empty()) || scope.is_some_and(|s| s.trim().is_empty()) {
+        return None;
+    }
+    Some((model, path, scope))
+}
+
 impl WorkerSelectionStage {
     pub fn new(
         worker_registry: Arc<WorkerRegistry>,
@@ -225,7 +239,7 @@ impl WorkerSelectionStage {
             .await
     }
 
-    async fn select_pd_pair_with_bound(
+    pub(crate) async fn select_pd_pair_with_bound(
         &self,
         model_id: Option<&str>,
         text: Option<&str>,
@@ -233,6 +247,9 @@ impl WorkerSelectionStage {
         headers: Option<&http::HeaderMap>,
         bound_weight_version: Option<&OnceLock<Option<String>>>,
     ) -> Option<(Arc<dyn Worker>, Arc<dyn Worker>)> {
+        let strict = self.pd_weight_version_mode == PdWeightVersionMode::Strict;
+        // Legacy retains independent selection on every attempt, including retries.
+        let bound_weight_version = bound_weight_version.filter(|_| strict);
         let all_workers = self.worker_registry.get_workers_filtered(
             model_id,
             None,
@@ -279,21 +296,42 @@ impl WorkerSelectionStage {
             return None;
         }
 
-        // Apply the hard compatibility constraint before invoking the policy. Two
-        // unlabeled workers remain compatible for legacy deployments.
+        let compatible = |prefill: &Arc<dyn Worker>, decode: &Arc<dyn Worker>| {
+            if !strict {
+                return true;
+            }
+            let identity = pd_model_identity(prefill);
+            identity.is_some()
+                && identity == pd_model_identity(decode)
+                && self
+                    .pd_weight_version_mode
+                    .compatible(weight_version(prefill), weight_version(decode))
+        };
+        // Apply strict identity constraints before invoking either policy.
         let compatible_prefill: Vec<_> = available_prefill
             .into_iter()
             .filter(|prefill| {
-                available_decode.iter().any(|decode| {
-                    self.pd_weight_version_mode
-                        .compatible(weight_version(prefill), weight_version(decode))
-                })
+                available_decode
+                    .iter()
+                    .any(|decode| compatible(prefill, decode))
             })
             .collect();
 
         if compatible_prefill.is_empty() {
             warn!("No weight-version-compatible PD worker pairs");
             return None;
+        }
+
+        // Without a requested model, strict mode needs one unambiguous model pool.
+        if strict && model_id.is_none() {
+            let first_model = pd_model_identity(&compatible_prefill[0]);
+            if compatible_prefill
+                .iter()
+                .any(|w| pd_model_identity(w) != first_model)
+            {
+                warn!("Strict PD selection requires an unambiguous model identity");
+                return None;
+            }
         }
 
         // Select using policies
@@ -314,13 +352,10 @@ impl WorkerSelectionStage {
             hash_ring,
         };
         let prefill_idx = policy.select_worker(&compatible_prefill, &info).await?;
-        let selected_prefill = compatible_prefill[prefill_idx].clone();
+        let selected_prefill = compatible_prefill.get(prefill_idx)?.clone();
         let compatible_decode: Vec<_> = available_decode
             .into_iter()
-            .filter(|decode| {
-                self.pd_weight_version_mode
-                    .compatible(weight_version(&selected_prefill), weight_version(decode))
-            })
+            .filter(|decode| compatible(&selected_prefill, decode))
             .collect();
         let decode_idx = policy.select_worker(&compatible_decode, &info).await?;
 
@@ -341,7 +376,7 @@ impl WorkerSelectionStage {
             policy_name,
         );
 
-        let selected_decode = compatible_decode[decode_idx].clone();
+        let selected_decode = compatible_decode.get(decode_idx)?.clone();
         if let Some(bound) = bound_weight_version {
             let selected_version = weight_version(&selected_prefill).map(str::to_string);
             if bound.set(selected_version).is_err() {
@@ -407,6 +442,7 @@ mod tests {
             policy_registry,
             WorkerSelectionMode::PrefillDecode,
         )
+        .with_pd_weight_version_mode(PdWeightVersionMode::Strict)
     }
 
     fn stage_with_pd_versions(prefill_version: &str, decode_version: &str) -> WorkerSelectionStage {
@@ -454,7 +490,6 @@ mod tests {
         assert_eq!(decode.metadata().labels["weight_version"], "v11");
     }
 
-    // Intentionally red until selection enforces PD weight-version compatibility.
     // This checks admission only; it does not exercise KV transfer or decode.
     #[tokio::test]
     async fn test_pd_weight_version_mismatched_pair_is_rejected() {
@@ -529,7 +564,8 @@ mod tests {
             worker_registry,
             policy_registry,
             WorkerSelectionMode::PrefillDecode,
-        );
+        )
+        .with_pd_weight_version_mode(PdWeightVersionMode::Strict);
         let (prefill, decode) = stage
             .select_pd_pair(Some("qwen"), None, None, None)
             .await

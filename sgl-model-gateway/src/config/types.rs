@@ -16,7 +16,7 @@ pub const DEFAULT_TCP_KEEPALIVE_SECS: u64 = 30;
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PdWeightVersionMode {
-    /// Preserve unlabeled legacy deployments while rejecting known mismatches.
+    /// Preserve original routing without weight-version constraints.
     #[default]
     Legacy,
     /// Require the same explicit version on both workers. The placeholder
@@ -27,10 +27,10 @@ pub enum PdWeightVersionMode {
 impl PdWeightVersionMode {
     pub fn compatible(self, prefill: Option<&str>, decode: Option<&str>) -> bool {
         match self {
-            Self::Legacy => prefill == decode,
+            Self::Legacy => true,
             Self::Strict => matches!(
                 (prefill, decode),
-                (Some(p), Some(d)) if !p.is_empty() && p != "default" && p == d
+                (Some(p), Some(d)) if !p.trim().is_empty() && p != "default" && p == d
             ),
         }
     }
@@ -653,6 +653,39 @@ impl RouterConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_pd_weight_version_configuration_defaults_to_legacy() {
+        let mut value = serde_json::to_value(RouterConfig::default()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("pd_weight_version_mode");
+        let config: RouterConfig = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(config.pd_weight_version_mode, PdWeightVersionMode::Legacy);
+        value["pd_weight_version_mode"] = serde_json::json!("strict");
+        let config: RouterConfig = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(config.pd_weight_version_mode, PdWeightVersionMode::Strict);
+        value["pd_weight_version_mode"] = serde_json::json!("typo");
+        assert!(serde_json::from_value::<RouterConfig>(value).is_err());
+    }
+
+    #[test]
+    fn test_pd_weight_version_mode_contract() {
+        for (p, d) in [
+            (None, None),
+            (Some("v11"), None),
+            (None, Some("v11")),
+            (Some("v10"), Some("v11")),
+            (Some("default"), Some("default")),
+            (Some(""), Some("")),
+            (Some("  "), Some("  ")),
+        ] {
+            assert!(PdWeightVersionMode::Legacy.compatible(p, d));
+            assert!(!PdWeightVersionMode::Strict.compatible(p, d));
+        }
+        assert!(PdWeightVersionMode::Strict.compatible(Some("v11"), Some("v11")));
+    }
 
     #[test]
     fn test_router_config_default() {

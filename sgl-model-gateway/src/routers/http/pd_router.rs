@@ -983,7 +983,8 @@ impl PDRouter {
         }
     }
 
-    async fn select_pd_pair(
+    #[cfg(test)]
+    pub(crate) async fn select_pd_pair(
         &self,
         request_text: Option<&str>,
         model_id: Option<&str>,
@@ -993,14 +994,22 @@ impl PDRouter {
             .await
     }
 
-    async fn select_pd_pair_with_bound(
+    pub(crate) async fn select_pd_pair_with_bound(
         &self,
         request_text: Option<&str>,
         model_id: Option<&str>,
         headers: Option<&HeaderMap>,
         bound_weight_version: Option<&OnceLock<Option<String>>>,
     ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>), String> {
-        let effective_model_id = if !self.enable_igw { None } else { model_id };
+        let strict = self.pd_weight_version_mode == PdWeightVersionMode::Strict;
+        // Legacy keeps its original non-IGW independent pools. Strict must honor
+        // an explicit model even when IGW is disabled.
+        let effective_model_id = if self.enable_igw || strict {
+            model_id
+        } else {
+            None
+        };
+        let bound_weight_version = if strict { bound_weight_version } else { None };
 
         debug!(
             "Selecting PD pair: enable_igw={}, model_id={:?}, effective_model_id={:?}",
@@ -1043,37 +1052,85 @@ impl PDRouter {
             };
         let available_prefill: Vec<_> = prefill_workers
             .into_iter()
-            .filter(|worker| worker.is_available() && matches_bound_version(worker))
+            .filter(|worker| {
+                worker.is_available()
+                    && matches_bound_version(worker)
+                    && (!strict
+                        || worker.metadata().connection_mode == crate::core::ConnectionMode::Http)
+            })
             .collect();
         let available_decode: Vec<_> = decode_workers
             .into_iter()
-            .filter(|worker| worker.is_available() && matches_bound_version(worker))
+            .filter(|worker| {
+                worker.is_available()
+                    && matches_bound_version(worker)
+                    && (!strict
+                        || worker.metadata().connection_mode == crate::core::ConnectionMode::Http)
+            })
             .collect();
+        let compatible_pair = |prefill: &Arc<dyn Worker>, decode: &Arc<dyn Worker>| {
+            if !strict {
+                return true;
+            }
+            let model = prefill.model_id();
+            let matching_identity = !model.trim().is_empty()
+                && model != UNKNOWN_MODEL_ID
+                && model != "default"
+                && model == decode.model_id()
+                && ["model_path", "deployment_scope"].iter().all(|key| {
+                    match (
+                        prefill.metadata().labels.get(*key),
+                        decode.metadata().labels.get(*key),
+                    ) {
+                        (None, None) => true,
+                        (Some(p), Some(d)) => !p.trim().is_empty() && p == d,
+                        _ => false,
+                    }
+                });
+            matching_identity
+                && self.pd_weight_version_mode.compatible(
+                    prefill
+                        .metadata()
+                        .labels
+                        .get("weight_version")
+                        .map(String::as_str),
+                    decode
+                        .metadata()
+                        .labels
+                        .get("weight_version")
+                        .map(String::as_str),
+                )
+        };
         let compatible_prefill: Vec<_> = available_prefill
             .into_iter()
             .filter(|prefill| {
-                available_decode.iter().any(|decode| {
-                    self.pd_weight_version_mode.compatible(
-                        prefill
-                            .metadata()
-                            .labels
-                            .get("weight_version")
-                            .map(String::as_str),
-                        decode
-                            .metadata()
-                            .labels
-                            .get("weight_version")
-                            .map(String::as_str),
-                    )
-                })
+                available_decode
+                    .iter()
+                    .any(|decode| compatible_pair(prefill, decode))
             })
             .collect();
 
         if compatible_prefill.is_empty() && !available_decode.is_empty() {
             return Err(format!(
-                "No weight-version-compatible PD pair in {:?} mode",
+                "No model-identity and weight-version compatible PD pair in {:?} mode",
                 self.pd_weight_version_mode
             ));
+        }
+
+        if strict && model_id.is_none() {
+            let identities: std::collections::HashSet<_> = compatible_prefill
+                .iter()
+                .map(|worker| {
+                    (
+                        worker.model_id(),
+                        worker.metadata().labels.get("model_path"),
+                        worker.metadata().labels.get("deployment_scope"),
+                    )
+                })
+                .collect();
+            if identities.len() > 1 {
+                return Err("Ambiguous strict PD model identity; specify a model or use a single deployment pool".to_string());
+            }
         }
 
         let prefill_policy = self.policy_registry.get_prefill_policy();
@@ -1096,20 +1153,7 @@ impl PDRouter {
 
         let compatible_decode: Vec<_> = available_decode
             .into_iter()
-            .filter(|decode| {
-                self.pd_weight_version_mode.compatible(
-                    prefill
-                        .metadata()
-                        .labels
-                        .get("weight_version")
-                        .map(String::as_str),
-                    decode
-                        .metadata()
-                        .labels
-                        .get("weight_version")
-                        .map(String::as_str),
-                )
-            })
+            .filter(|decode| compatible_pair(&prefill, decode))
             .collect();
         let decode = Self::pick_worker_by_policy_arc(
             &compatible_decode,
@@ -1200,7 +1244,13 @@ impl PDRouter {
                 )
             })?;
 
-        Ok(available_workers[selected_idx].clone())
+        available_workers.get(selected_idx).cloned().ok_or_else(|| {
+            format!(
+                "Policy {} returned an out-of-range {} worker index",
+                policy.name(),
+                worker_type
+            )
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1893,13 +1943,21 @@ mod tests {
         Box::new(worker)
     }
 
+    fn create_strict_pd_router() -> PDRouter {
+        let mut router = create_test_pd_router();
+        router.pd_weight_version_mode = PdWeightVersionMode::Strict;
+        router
+    }
+
     fn register_versioned_worker(
         router: &PDRouter,
         url: &str,
         worker_type: WorkerType,
         version: Option<&str>,
     ) {
-        let mut builder = BasicWorkerBuilder::new(url).worker_type(worker_type);
+        let mut builder = BasicWorkerBuilder::new(url)
+            .worker_type(worker_type)
+            .label("model_id", "test-model");
         if let Some(version) = version {
             builder = builder.label("weight_version", version);
         }
@@ -2003,7 +2061,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_pd_weight_version_http_matching_pair_is_selected() {
-        let router = create_test_pd_router();
+        let router = create_strict_pd_router();
         register_versioned_worker(
             &router,
             "http://prefill",
@@ -2024,7 +2082,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_pd_weight_version_http_mismatch_is_rejected() {
-        let router = create_test_pd_router();
+        let router = create_strict_pd_router();
         register_versioned_worker(
             &router,
             "http://prefill",
@@ -2040,7 +2098,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_pd_weight_version_http_finds_match_in_mixed_pool() {
-        let router = create_test_pd_router();
+        let router = create_strict_pd_router();
         for version in ["v10", "v11"] {
             register_versioned_worker(
                 &router,
@@ -2091,7 +2149,7 @@ mod tests {
     #[tokio::test]
     async fn test_pd_weight_version_http_retry_cannot_drift_to_new_version() {
         let bound = OnceLock::new();
-        let first_attempt = create_test_pd_router();
+        let first_attempt = create_strict_pd_router();
         register_versioned_worker(
             &first_attempt,
             "http://v10-prefill",
@@ -2112,7 +2170,7 @@ mod tests {
             .is_ok());
         assert_eq!(bound.get().and_then(Option::as_deref), Some("v10"));
 
-        let new_version_only = create_test_pd_router();
+        let new_version_only = create_strict_pd_router();
         register_versioned_worker(
             &new_version_only,
             "http://v11-prefill",

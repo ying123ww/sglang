@@ -35,6 +35,9 @@ pub mod router_manager;
 pub mod streaming_utils;
 pub mod tokenize;
 
+#[cfg(test)]
+mod pd_selection_tests;
+
 pub use factory::RouterFactory;
 // Re-export HTTP routers for convenience
 pub use http::{pd_router, pd_types, router};
