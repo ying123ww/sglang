@@ -983,7 +983,6 @@ impl PDRouter {
         }
     }
 
-    #[cfg(test)]
     pub(crate) async fn select_pd_pair(
         &self,
         request_text: Option<&str>,
