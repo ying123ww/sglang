@@ -228,6 +228,57 @@ script checks GPU and port availability, launches only its own P/D/Gateway
 processes, validates the response and NIXL markers, and terminates only those
 processes on exit.
 
+## CPU cache-aware regression follow-up (2026-09-14)
+
+Added `test_pd_weight_version_cache_aware_warm_prefix_contract` in
+`sgl-model-gateway/src/routers/pd_selection_tests.rs`, committed as `2fa2b4c`.
+This follow-up changes only tests and documentation, not production routing.
+
+Unlike the earlier RoundRobin version-mismatch counterexample, this test uses
+the real `CacheAwarePolicy`: it initializes the worker trees, warms a prompt
+on a chosen P, and verifies that the unrestricted policy prefers that cached P
+even when a cold P appears first in the candidate list. It then passes the
+same prompt through the actual HTTP and gRPC P/D selection functions.
+
+| Cached P | Alternative P | D | Mode | Actual result in HTTP and gRPC |
+| --- | --- | --- | --- | --- |
+| v10 | cold v11 | v11 | legacy | cached P-v10 / D-v11 accepted |
+| v10 | cold v11 | v11 | strict | cold P-v11 / D-v11 selected |
+| v10 | none | v11 | strict | no compatible pair; request selection rejected |
+| v11 | cold v11 | v11 | strict | cached P-v11 / D-v11 selected |
+
+All four scenarios are newly added tests. The first reproduces original
+independent routing behavior retained by legacy mode; the other three verify
+the project's strict constraint and preservation of compatible cache affinity.
+The result demonstrates that cache affinity does not itself establish weight
+compatibility: strict constrains the eligible candidates before policy selection.
+
+The explicit settings match Python `RouterArgs` defaults: cache threshold 0.3,
+load thresholds 64/1.5, eviction interval 60 seconds, and tree size 67108864.
+Rust CLI selection thresholds match, but its eviction interval is 120 seconds.
+Periodic eviction is not exercised. All workers have balanced zero load.
+
+Validation: **28 passed, 0 failed**, including the eight new scenario/transport
+combinations inside one matrix test. Rust formatting and `git diff --check`
+also passed. Evidence:
+
+```text
+.local/logs/cpu-cache-aware-contract.log
+```
+
+With the Cargo environment used by `scripts/pd_snapshot_repro/check_phase_ia.sh`:
+
+```bash
+cargo test --locked -j4 --manifest-path sgl-model-gateway/Cargo.toml \
+  --lib test_pd_weight_version -- --nocapture
+```
+
+No GPU was used. The cache hit is a Gateway prefix-affinity tree match, not a
+measured GPU KV-cache hit. Versions are controlled registry metadata, not
+different loaded weight snapshots. This does not validate actual cross-version
+GPU inference, KV transfer, concurrent weight updates, or cache performance.
+See also [Phase I-a acceptance](phase_ia_acceptance.md).
+
 ## Remaining protocol boundary
 
 A worker-side strict reader-lock recheck cannot be implemented honestly as a
@@ -271,4 +322,6 @@ ef8ccea fix(gateway): pin PD version across retries
 10994b7 fix(gateway): complete strict PD identity and legacy selection contract
 51aec90 test(gateway): exercise HTTP discovery through strict PD selection
 fa7f0ba fix(gateway): retain PD selector for production health checks
+66fecd0 docs(repro): close Phase I-a with reproducible CPU acceptance
+2fa2b4c test(gateway): verify cache affinity cannot bypass strict PD compatibility
 ```
