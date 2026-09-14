@@ -115,3 +115,40 @@ regressions, the Bucket regression, binary compilation, formatting, and shell
 syntax. It does not launch GPU inference. GPU single-model/NIXL-PD evidence
 and the remaining I-b protocol boundaries are recorded separately in
 `pd_weight_version_selection_bugfix.md`.
+
+## CPU cache-aware follow-up (2026-09-14)
+
+Added `test_pd_weight_version_cache_aware_warm_prefix_contract` in
+`sgl-model-gateway/src/routers/pd_selection_tests.rs`. No production code changed.
+It calls the real CacheAwarePolicy, initializes its worker trees, warms a full
+prompt on one P, and asserts that the unrestricted policy selects that P even
+when a cold P is first in the candidate slice. The same prompt then enters the
+production HTTP and gRPC P/D selectors. All workers have balanced zero load.
+
+| Cached P | Other P | D | Mode | Actual result, both selectors |
+| --- | --- | --- | --- | --- |
+| v10 | cold v11 | v11 | legacy | cached v10 P + v11 D accepted |
+| v10 | cold v11 | v11 | strict | cold v11 P + v11 D selected |
+| v10 | absent | v11 | strict | selection rejected |
+| v11 | cold v11 | v11 | strict | cached v11 P + v11 D selected |
+
+Configuration explicitly matches Python `RouterArgs` defaults: threshold 0.3,
+load thresholds 64/1.5, eviction 60 seconds, tree size 67108864. The Rust CLI
+uses the same selection thresholds but an eviction interval of 120 seconds;
+this short test does not exercise periodic eviction. It does not rely on
+`RouterConfig::default()` or `CacheAwareConfig::default()`.
+
+Result: **28 passed, 0 failed**, including the new eight-case matrix (four
+scenarios times two transports). Log: `.local/logs/cpu-cache-aware-contract.log`.
+Rerun with the Cargo environment documented by the CPU gate runner:
+
+```bash
+cargo test --locked -j4 --manifest-path sgl-model-gateway/Cargo.toml \
+  --lib test_pd_weight_version -- --nocapture
+```
+
+This proves cache affinity alone does not enforce version compatibility, while
+strict filtering takes precedence over affinity in these cases. Versions here
+are controlled registry labels; there is no GPU allocation, real KV cache-hit
+measurement, KV transfer, or inference with different weight snapshots. Cache
+retention across version changes and performance are not validated by this test.

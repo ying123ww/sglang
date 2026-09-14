@@ -14,7 +14,7 @@ use crate::{
         BasicWorkerBuilder, ConnectionMode, ModelCard, Worker, WorkerRegistry, WorkerType,
         UNKNOWN_MODEL_ID,
     },
-    policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
+    policies::{CacheAwarePolicy, LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -109,6 +109,104 @@ impl Harness {
 fn prefill() -> WorkerType {
     WorkerType::Prefill {
         bootstrap_port: Some(8998),
+    }
+}
+
+#[tokio::test]
+async fn test_pd_weight_version_cache_aware_warm_prefix_contract() {
+    const PROMPT: &str = "Explain why cached prefixes do not establish weight compatibility.";
+    for transport in [Transport::Http, Transport::Grpc] {
+        for (mode, cached_version, add_compatible, expected_p) in [
+            (
+                PdWeightVersionMode::Legacy,
+                "v10",
+                true,
+                Some("http://cached-p:30000"),
+            ),
+            (
+                PdWeightVersionMode::Strict,
+                "v10",
+                true,
+                Some("http://cold-p:30000"),
+            ),
+            (PdWeightVersionMode::Strict, "v10", false, None),
+            (
+                PdWeightVersionMode::Strict,
+                "v11",
+                true,
+                Some("http://cached-p:30000"),
+            ),
+        ] {
+            // Explicit CLI-style settings, not CacheAwareConfig::default().
+            let h = Harness::new(
+                transport,
+                mode,
+                PolicyConfig::CacheAware {
+                    cache_threshold: 0.3,
+                    balance_abs_threshold: 64,
+                    balance_rel_threshold: 1.5,
+                    eviction_interval_secs: 60,
+                    max_tree_size: 67108864,
+                },
+            );
+            let mut candidates = Vec::new();
+            if add_compatible {
+                candidates.push(h.add(h.worker(
+                    "http://cold-p:30000",
+                    prefill(),
+                    "qwen",
+                    Some("v11"),
+                )));
+            }
+            let cached = h.add(h.worker(
+                "http://cached-p:30000",
+                prefill(),
+                "qwen",
+                Some(cached_version),
+            ));
+            candidates.push(cached.clone());
+            let decode = h.add(h.worker("http://d:30001", WorkerType::Decode, "qwen", Some("v11")));
+            let policy = h.http.policy_registry.get_default_policy();
+            let cache = policy.as_any().downcast_ref::<CacheAwarePolicy>().unwrap();
+            let mut all = candidates.clone();
+            all.push(decode.clone());
+            cache.init_workers(&all);
+            let info = SelectWorkerInfo {
+                request_text: Some(PROMPT),
+                ..Default::default()
+            };
+            // Warm through the real policy. Then prove its unrestricted preference
+            // is the cached worker, even with a cold worker first in the slice.
+            assert_eq!(policy.select_worker(&[cached], &info).await, Some(0));
+            assert_eq!(
+                policy.select_worker(&candidates, &info).await,
+                Some(candidates.len() - 1)
+            );
+            let result = match transport {
+                Transport::Http => {
+                    h.http
+                        .select_pd_pair_with_bound(Some(PROMPT), Some("qwen"), None, None)
+                        .await
+                }
+                Transport::Grpc => h
+                    .grpc
+                    .select_pd_pair_with_bound(Some("qwen"), Some(PROMPT), None, None, None)
+                    .await
+                    .ok_or_else(|| "No compatible pair".to_string()),
+            };
+            match expected_p {
+                Some(url) => {
+                    let (p, d) = result.unwrap();
+                    assert_eq!(p.url(), url, "{transport:?}, cached={cached_version}");
+                    assert_eq!(d.url(), decode.url());
+                }
+                None => assert!(
+                    result.is_err(),
+                    "{transport:?}: incompatible cache affinity must not bypass strict"
+                ),
+            }
+            println!("cache-aware {transport:?} mode={mode:?} cached={cached_version} compatible_alternative={add_compatible} selected={expected_p:?}");
+        }
     }
 }
 
