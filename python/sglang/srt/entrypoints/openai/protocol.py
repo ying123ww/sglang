@@ -407,6 +407,8 @@ class CompletionRequest(BaseModel):
 
     # For custom metric labels
     custom_labels: Optional[Dict[str, str]] = None
+    # Expected weight version for disaggregated/snapshot serving verification
+    expected_weight_version: Optional[str] = None
 
     @model_validator(mode="before")
     @classmethod
@@ -974,6 +976,8 @@ class ChatCompletionRequest(BaseModel):
     routed_dp_rank: Optional[int] = None
     # For PD disagg — hint telling decode which prefill DP worker has the KV cache
     disagg_prefill_dp_rank: Optional[int] = None
+    # Expected weight version for disaggregated/snapshot serving verification
+    expected_weight_version: Optional[str] = None
     # Deprecated: use routed_dp_rank instead
     data_parallel_rank: Optional[int] = None
 

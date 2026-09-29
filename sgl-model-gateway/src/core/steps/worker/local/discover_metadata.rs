@@ -58,6 +58,7 @@ pub struct ModelInfo {
     pub architectures: Option<Vec<String>>,
 }
 
+#[allow(dead_code)]
 fn insert_model_info_labels(labels: &mut HashMap<String, String>, model_info: ModelInfo) {
     if let Some(tokenizer_path) = model_info.tokenizer_path.filter(|s| !s.is_empty()) {
         labels.insert("tokenizer_path".to_string(), tokenizer_path);

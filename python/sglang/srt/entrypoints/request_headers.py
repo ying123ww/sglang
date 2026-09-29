@@ -16,6 +16,8 @@ _HEADER_OVERRIDES = {
     "x-override-routed-dp-rank": ("routed_dp_rank", int),
     "x-override-disagg-prefill-dp-rank": ("disagg_prefill_dp_rank", int),
     "x-override-priority": ("priority", int),
+    "x-override-expected-weight-version": ("expected_weight_version", str),
+    "x-expected-weight-version": ("expected_weight_version", str),
 }
 
 

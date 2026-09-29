@@ -916,13 +916,23 @@ async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
     if envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get():
         apply_header_overrides(obj, request.headers)
+    if getattr(obj, "expected_weight_version", None) is None and request is not None:
+        header_ver = request.headers.get("x-expected-weight-version") or request.headers.get("x-override-expected-weight-version")
+        if header_ver:
+            obj.expected_weight_version = header_ver
     if obj.stream:
+        generator = _global_state.tokenizer_manager.generate_request(obj, request)
+        try:
+            first_out = await generator.__anext__()
+        except HTTPException:
+            raise
+        except ValueError as e:
+            return _create_error_response(e)
 
         async def stream_results() -> AsyncIterator[bytes]:
+            yield b"data: " + dumps_json(first_out) + b"\n\n"
             try:
-                async for out in _global_state.tokenizer_manager.generate_request(
-                    obj, request
-                ):
+                async for out in generator:
                     yield b"data: " + dumps_json(out) + b"\n\n"
             except ValueError as e:
                 # A client disconnect also surfaces here. It's a client-side
@@ -955,6 +965,8 @@ async def generate_request(obj: GenerateReqInput, request: Request):
                 obj, request
             ).__anext__()
             return orjson_response(ret)
+        except HTTPException:
+            raise
         except ValueError as e:
             logger.error(f"[http_server] Error: {e}")
             return _create_error_response(e)

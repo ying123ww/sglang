@@ -895,6 +895,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 await self.is_pause_cond.wait_for(lambda: not self.is_pause)
 
             async with self.model_update_lock.reader_lock:
+                expected_ver = getattr(obj, "expected_weight_version", None)
+                if expected_ver is not None and expected_ver.strip() and expected_ver != "default":
+                    current_ver = self.config_value("weight_version")
+                    if current_ver != expected_ver:
+                        raise fastapi.HTTPException(
+                            status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                            detail=(
+                                f"Weight version mismatch: request expected weight_version={expected_ver!r}, "
+                                f"but worker is currently on weight_version={current_ver!r}"
+                            ),
+                        )
+
                 await self._validate_and_resolve_lora(obj)
 
                 # Tokenize the request and send it to the scheduler

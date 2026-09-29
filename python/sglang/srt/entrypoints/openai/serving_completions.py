@@ -140,7 +140,13 @@ class OpenAIServingCompletion(OpenAIServingBase):
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
             images_config=getattr(request, "images_config", None),
+            expected_weight_version=getattr(request, "expected_weight_version", None),
         )
+
+        if raw_request is not None and adapted_request.expected_weight_version is None:
+            h_ver = raw_request.headers.get("x-expected-weight-version") or raw_request.headers.get("x-override-expected-weight-version")
+            if h_ver:
+                adapted_request.expected_weight_version = h_ver
 
         return adapted_request, request
 

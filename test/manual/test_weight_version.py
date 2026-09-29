@@ -166,6 +166,42 @@ class TestWeightVersion(CustomTestCase):
             response.json()["metadata"]["weight_version"], "final_version_3.0"
         )
 
+        # Check expected_weight_version match succeeds (200)
+        response = requests.post(
+            f"{self.base_url}/generate",
+            json={
+                "text": "Match test",
+                "sampling_params": {"temperature": 0.0, "max_new_tokens": 2},
+                "expected_weight_version": "final_version_3.0",
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+
+        # Check expected_weight_version mismatch under reader_lock fails with 503
+        response = requests.post(
+            f"{self.base_url}/generate",
+            json={
+                "text": "Mismatch test",
+                "sampling_params": {"temperature": 0.0, "max_new_tokens": 2},
+                "expected_weight_version": "old_outdated_version",
+            },
+        )
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("Weight version mismatch", response.text)
+
+        # Check x-expected-weight-version header mismatch fails with 503
+        response = requests.post(
+            f"{self.base_url}/v1/chat/completions",
+            headers={"x-expected-weight-version": "old_outdated_version"},
+            json={
+                "model": self.model,
+                "messages": [{"role": "user", "content": "Header mismatch"}],
+                "max_tokens": 2,
+                "temperature": 0.0,
+            },
+        )
+        self.assertEqual(response.status_code, 503)
+
         print("All weight_version functionality tests passed!")
 
     def test_update_weight_version_with_weight_updates(self):

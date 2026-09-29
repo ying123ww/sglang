@@ -320,6 +320,8 @@ class GenerateReqInput:
     priority: Optional[int] = None
     # Extra cache key for caller-defined request classification.
     extra_key: Optional[Union[List[str], str]] = None
+    # Expected weight version for disaggregated/snapshot serving verification
+    expected_weight_version: Optional[str] = None
 
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False

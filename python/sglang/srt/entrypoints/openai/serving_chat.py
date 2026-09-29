@@ -1285,12 +1285,18 @@ class OpenAIServingChat(OpenAIServingBase):
                 or request.return_token_ids
                 or self._should_return_input_ids(request)
             ),
+            expected_weight_version=getattr(request, "expected_weight_version", None),
         )
         if (
             raw_request is not None
             and envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get()
         ):
             apply_header_overrides(adapted_request, raw_request.headers)
+
+        if raw_request is not None and adapted_request.expected_weight_version is None:
+            h_ver = raw_request.headers.get("x-expected-weight-version") or raw_request.headers.get("x-override-expected-weight-version")
+            if h_ver:
+                adapted_request.expected_weight_version = h_ver
 
         return adapted_request, request
 

@@ -10,7 +10,7 @@ use axum::{
     extract::Request,
     http::{
         header::{CONTENT_LENGTH, CONTENT_TYPE},
-        HeaderMap, HeaderValue, StatusCode,
+        HeaderMap, HeaderName, HeaderValue, StatusCode,
     },
     response::{IntoResponse, Response},
 };
@@ -445,6 +445,11 @@ impl PDRouter {
                             Err(e) => return Self::handle_serialization_error(e),
                         };
 
+                        if let Some(version) = prefill.metadata().labels.get("weight_version") {
+                            json_request["expected_weight_version"] =
+                                Value::String(version.clone());
+                        }
+
                         let ctx_is_stream = context.is_stream;
                         let response = self
                             .execute_dual_dispatch_internal(
@@ -675,6 +680,11 @@ impl PDRouter {
 
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
         inject_trace_context_http(&mut headers_with_trace);
+        if let Some(version) = prefill.metadata().labels.get("weight_version") {
+            if let Ok(hv) = HeaderValue::from_str(version) {
+                headers_with_trace.insert(HeaderName::from_static("x-expected-weight-version"), hv);
+            }
+        }
         let headers = Some(&headers_with_trace);
 
         let (prepared_prefill, prepared_decode) = match Self::prepare_pd_worker_requests(
@@ -1848,6 +1858,7 @@ impl RouterTrait for PDRouter {
             request_text,
             model_id,
             headers: headers.cloned(),
+            bound_weight_version: Arc::new(OnceLock::new()),
         };
 
         self.execute_dual_dispatch(headers, body, context).await
@@ -2377,5 +2388,42 @@ mod tests {
         // Guards dropped when response dropped
         assert_eq!(prefill_ref.load(), 0);
         assert_eq!(decode_ref.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_pd_weight_version_http_injects_expected_weight_version() {
+        let router = create_strict_pd_router();
+        register_versioned_worker(
+            &router,
+            "http://prefill",
+            WorkerType::Prefill {
+                bootstrap_port: Some(8998),
+            },
+            Some("v10"),
+        );
+        register_versioned_worker(&router, "http://decode", WorkerType::Decode, Some("v10"));
+
+        let (prefill, decode) = router
+            .select_pd_pair(None, None, None)
+            .await
+            .expect("should select pair");
+
+        let mut json_req = serde_json::json!({"prompt": "hello"});
+        if let Some(version) = prefill.metadata().labels.get("weight_version") {
+            json_req["expected_weight_version"] = Value::String(version.clone());
+        }
+        assert_eq!(json_req["expected_weight_version"], "v10");
+
+        let (prepared_p, prepared_d) = PDRouter::prepare_pd_worker_requests(
+            "/generate",
+            &json_req,
+            prefill.as_ref(),
+            decode.as_ref(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(prepared_p.body["expected_weight_version"], "v10");
+        assert_eq!(prepared_d.body["expected_weight_version"], "v10");
     }
 }

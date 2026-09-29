@@ -515,18 +515,21 @@ class TokenizerControlMixin:
             if is_paused:
                 results = await self.update_weights_from_distributed_communicator(obj)
 
+        def _finalize_update(update_results):
+            merged_success, merged_msg = FanOutCommunicator.merge_results(update_results)
+            if merged_success and obj.flush_cache and self.mm_processor is not None:
+                self.mm_processor.clear_preprocess_cache()
+            if merged_success and obj.weight_version is not None:
+                self._update_weight_version_if_provided(obj.weight_version)
+                merged_msg += f" Weight version updated to {obj.weight_version}."
+            return merged_success, merged_msg
+
         if not is_paused:
             async with self.model_update_lock.writer_lock:
                 results = await self.update_weights_from_distributed_communicator(obj)
-
-        success, message = FanOutCommunicator.merge_results(results)
-        if success and obj.flush_cache and self.mm_processor is not None:
-            self.mm_processor.clear_preprocess_cache()
-        if success and obj.weight_version is not None:
-            self._update_weight_version_if_provided(obj.weight_version)
-            message += f" Weight version updated to {obj.weight_version}."
-
-        return success, message
+                return _finalize_update(results)
+        else:
+            return _finalize_update(results)
 
     async def init_weights_send_group_for_remote_instance(
         self: TokenizerManager,
@@ -578,18 +581,21 @@ class TokenizerControlMixin:
             if is_paused:
                 results = await self.update_weights_from_tensor_communicator(obj)
 
+        def _finalize_tensor_update(update_results):
+            merged_success, merged_msg = FanOutCommunicator.merge_results(update_results)
+            if merged_success and obj.flush_cache and self.mm_processor is not None:
+                self.mm_processor.clear_preprocess_cache()
+            if merged_success and obj.weight_version is not None:
+                self._update_weight_version_if_provided(obj.weight_version)
+                merged_msg += f" Weight version updated to {obj.weight_version}."
+            return merged_success, merged_msg
+
         if not is_paused:
             async with self.model_update_lock.writer_lock:
                 results = await self.update_weights_from_tensor_communicator(obj)
-
-        success, message = FanOutCommunicator.merge_results(results)
-        if success and obj.flush_cache and self.mm_processor is not None:
-            self.mm_processor.clear_preprocess_cache()
-        if success and obj.weight_version is not None:
-            self._update_weight_version_if_provided(obj.weight_version)
-            message += f" Weight version updated to {obj.weight_version}."
-
-        return success, message
+                return _finalize_tensor_update(results)
+        else:
+            return _finalize_tensor_update(results)
 
     async def update_weights_from_ipc(
         self: TokenizerManager,
@@ -597,7 +603,14 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
         """Update weights via IPC for checkpoint-engine integration."""
-        self.auto_create_handle_loop()
+        def _finalize_ipc_update(merged_success, merged_msg):
+            if merged_success and obj.flush_cache and self.mm_processor is not None:
+                self.mm_processor.clear_preprocess_cache()
+            if merged_success and obj.weight_version is not None:
+                self._update_weight_version_if_provided(obj.weight_version)
+                merged_msg += f" Weight version updated to {obj.weight_version}."
+            return merged_success, merged_msg
+
         try:
             # For now, we only support single data parallel instance
             assert get_parallel().dp_size == 1 or get_parallel().enable_dp_attention, (
@@ -613,19 +626,15 @@ class TokenizerControlMixin:
             if not is_paused:
                 async with self.model_update_lock.writer_lock:
                     results = await self.update_weights_from_ipc_communicator(obj)
-            success, message = FanOutCommunicator.merge_results(results)
+                    success, message = FanOutCommunicator.merge_results(results)
+                    return _finalize_ipc_update(success, message)
+            else:
+                success, message = FanOutCommunicator.merge_results(results)
+                return _finalize_ipc_update(success, message)
         except Exception as e:
             error_msg = f"IPC weight update failed: {str(e)}"
             logger.error(error_msg)
-            success, message = False, error_msg
-
-        if success and obj.flush_cache and self.mm_processor is not None:
-            self.mm_processor.clear_preprocess_cache()
-        if success and obj.weight_version is not None:
-            self._update_weight_version_if_provided(obj.weight_version)
-            message += f" Weight version updated to {obj.weight_version}."
-
-        return success, message
+            return _finalize_ipc_update(False, error_msg)
 
     async def _unload_lora_adapter_locked(
         self: TokenizerManager,
@@ -1041,8 +1050,9 @@ class TokenizerControlMixin:
         self: TokenizerManager, obj: UpdateWeightVersionReqInput
     ) -> None:
         self.auto_create_handle_loop()
-        await self.update_weight_version_communicator(obj)
-        self._update_weight_version_if_provided(obj.new_version)
+        async with self.model_update_lock.writer_lock:
+            await self.update_weight_version_communicator(obj)
+            self._update_weight_version_if_provided(obj.new_version)
 
     def _update_weight_version_if_provided(
         self: TokenizerManager, weight_version: Optional[str]
