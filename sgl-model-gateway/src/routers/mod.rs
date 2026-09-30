@@ -30,6 +30,7 @@ pub mod mcp_utils;
 pub mod mesh;
 pub mod openai;
 pub mod parse;
+pub mod pd_pair_planner;
 pub mod persistence_utils;
 pub mod router_manager;
 pub mod streaming_utils;
@@ -41,6 +42,7 @@ mod pd_selection_tests;
 pub use factory::RouterFactory;
 // Re-export HTTP routers for convenience
 pub use http::{pd_router, pd_types, router};
+pub use pd_pair_planner::{PdPairPlanner, PdPlanError, PdPlanParams};
 
 /// Core trait for all router implementations
 ///

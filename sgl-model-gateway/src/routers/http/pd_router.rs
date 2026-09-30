@@ -26,15 +26,15 @@ use super::pd_types::api_path;
 use crate::{
     config::types::{PdWeightVersionMode, RetryConfig},
     core::{
-        is_retryable_status, HashRing, RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry,
-        WorkerType, UNKNOWN_MODEL_ID,
+        is_retryable_status, RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType,
+        UNKNOWN_MODEL_ID,
     },
     observability::{
         events::{self, Event},
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
-    policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
+    policies::{PolicyRegistry, SelectWorkerInfo},
     protocols::{
         chat::ChatCompletionRequest,
         classify::ClassifyRequest,
@@ -49,6 +49,7 @@ use crate::{
         error,
         grpc::utils::{error_type_from_status, route_to_endpoint},
         header_utils,
+        pd_pair_planner::{PdPairPlanner, PdPlanParams},
         streaming_utils::BreakerTrackedStream,
         RouterTrait,
     },
@@ -1047,101 +1048,6 @@ impl PDRouter {
             self.worker_registry.get_decode_workers()
         };
 
-        let matches_bound_version =
-            |worker: &Arc<dyn Worker>| match bound_weight_version.and_then(OnceLock::get) {
-                Some(bound) => {
-                    worker
-                        .metadata()
-                        .labels
-                        .get("weight_version")
-                        .map(String::as_str)
-                        == bound.as_deref()
-                }
-                None => true,
-            };
-        let available_prefill: Vec<_> = prefill_workers
-            .into_iter()
-            .filter(|worker| {
-                worker.is_available()
-                    && matches_bound_version(worker)
-                    && (!strict
-                        || worker.metadata().connection_mode == crate::core::ConnectionMode::Http)
-            })
-            .collect();
-        let available_decode: Vec<_> = decode_workers
-            .into_iter()
-            .filter(|worker| {
-                worker.is_available()
-                    && matches_bound_version(worker)
-                    && (!strict
-                        || worker.metadata().connection_mode == crate::core::ConnectionMode::Http)
-            })
-            .collect();
-        let compatible_pair = |prefill: &Arc<dyn Worker>, decode: &Arc<dyn Worker>| {
-            if !strict {
-                return true;
-            }
-            let model = prefill.model_id();
-            let matching_identity = !model.trim().is_empty()
-                && model != UNKNOWN_MODEL_ID
-                && model != "default"
-                && model == decode.model_id()
-                && ["model_path", "deployment_scope"].iter().all(|key| {
-                    match (
-                        prefill.metadata().labels.get(*key),
-                        decode.metadata().labels.get(*key),
-                    ) {
-                        (None, None) => true,
-                        (Some(p), Some(d)) => !p.trim().is_empty() && p == d,
-                        _ => false,
-                    }
-                });
-            matching_identity
-                && self.pd_weight_version_mode.compatible(
-                    prefill
-                        .metadata()
-                        .labels
-                        .get("weight_version")
-                        .map(String::as_str),
-                    decode
-                        .metadata()
-                        .labels
-                        .get("weight_version")
-                        .map(String::as_str),
-                )
-        };
-        let compatible_prefill: Vec<_> = available_prefill
-            .into_iter()
-            .filter(|prefill| {
-                available_decode
-                    .iter()
-                    .any(|decode| compatible_pair(prefill, decode))
-            })
-            .collect();
-
-        if compatible_prefill.is_empty() && !available_decode.is_empty() {
-            return Err(format!(
-                "No model-identity and weight-version compatible PD pair in {:?} mode",
-                self.pd_weight_version_mode
-            ));
-        }
-
-        if strict && model_id.is_none() {
-            let identities: std::collections::HashSet<_> = compatible_prefill
-                .iter()
-                .map(|worker| {
-                    (
-                        worker.model_id(),
-                        worker.metadata().labels.get("model_path"),
-                        worker.metadata().labels.get("deployment_scope"),
-                    )
-                })
-                .collect();
-            if identities.len() > 1 {
-                return Err("Ambiguous strict PD model identity; specify a model or use a single deployment pool".to_string());
-            }
-        }
-
         let prefill_policy = self.policy_registry.get_prefill_policy();
         let decode_policy = self.policy_registry.get_decode_policy();
 
@@ -1150,43 +1056,26 @@ impl PDRouter {
             .worker_registry
             .get_hash_ring(effective_model_id.unwrap_or(UNKNOWN_MODEL_ID));
 
-        let prefill = Self::pick_worker_by_policy_arc(
-            &compatible_prefill,
-            &*prefill_policy,
+        let select_info = SelectWorkerInfo {
             request_text,
-            headers,
-            hash_ring.clone(),
-            "prefill",
-        )
-        .await?;
-
-        let compatible_decode: Vec<_> = available_decode
-            .into_iter()
-            .filter(|decode| compatible_pair(&prefill, decode))
-            .collect();
-        let decode = Self::pick_worker_by_policy_arc(
-            &compatible_decode,
-            &*decode_policy,
-            request_text,
+            tokens: None,
             headers,
             hash_ring,
-            "decode",
-        )
-        .await?;
+        };
 
-        if let Some(bound) = bound_weight_version {
-            let selected_version = prefill.metadata().labels.get("weight_version").cloned();
-            if bound.set(selected_version).is_err() {
-                debug_assert_eq!(
-                    bound.get().and_then(Option::as_deref),
-                    prefill
-                        .metadata()
-                        .labels
-                        .get("weight_version")
-                        .map(String::as_str)
-                );
-            }
-        }
+        let (prefill, decode) = PdPairPlanner::plan(PdPlanParams {
+            prefill_workers,
+            decode_workers,
+            prefill_policy: &*prefill_policy,
+            decode_policy: &*decode_policy,
+            mode: self.pd_weight_version_mode,
+            model_id: effective_model_id,
+            bound_weight_version,
+            select_info: &select_info,
+            required_connection_mode: Some(crate::core::ConnectionMode::Http),
+        })
+        .await
+        .map_err(|e| e.to_string())?;
 
         // Record worker selection metrics (Layer 3)
         let model = model_id.unwrap_or(UNKNOWN_MODEL_ID);
@@ -1204,62 +1093,6 @@ impl PDRouter {
         );
 
         Ok((prefill, decode))
-    }
-
-    async fn pick_worker_by_policy_arc(
-        workers: &[Arc<dyn Worker>],
-        policy: &dyn LoadBalancingPolicy,
-        request_text: Option<&str>,
-        headers: Option<&HeaderMap>,
-        hash_ring: Option<Arc<HashRing>>,
-        worker_type: &str,
-    ) -> Result<Arc<dyn Worker>, String> {
-        if workers.is_empty() {
-            return Err(format!(
-                "No {} workers available. Please check if {} servers are configured and healthy.",
-                worker_type, worker_type
-            ));
-        }
-
-        let available_workers: Vec<Arc<dyn Worker>> = workers
-            .iter()
-            .filter(|w| w.is_available())
-            .cloned()
-            .collect();
-
-        if available_workers.is_empty() {
-            return Err(format!(
-                "No available {} workers (all circuits open or unhealthy)",
-                worker_type
-            ));
-        }
-
-        let selected_idx = policy
-            .select_worker(
-                &available_workers,
-                &SelectWorkerInfo {
-                    request_text,
-                    tokens: None, // HTTP doesn't have tokens, use gRPC for PrefixHash
-                    headers,
-                    hash_ring,
-                },
-            )
-            .await
-            .ok_or_else(|| {
-                format!(
-                    "Policy {} failed to select a {} worker",
-                    policy.name(),
-                    worker_type
-                )
-            })?;
-
-        available_workers.get(selected_idx).cloned().ok_or_else(|| {
-            format!(
-                "Policy {} returned an out-of-range {} worker index",
-                policy.name(),
-                worker_type
-            )
-        })
     }
 
     #[allow(clippy::too_many_arguments)]

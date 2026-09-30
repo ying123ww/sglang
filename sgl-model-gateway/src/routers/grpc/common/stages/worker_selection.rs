@@ -15,6 +15,7 @@ use crate::{
     routers::{
         error,
         grpc::context::{RequestContext, WorkerSelection},
+        pd_pair_planner::{PdPairPlanner, PdPlanParams},
     },
 };
 
@@ -31,28 +32,6 @@ pub(crate) enum WorkerSelectionMode {
     Regular,
     /// PD mode: select prefill + decode workers
     PrefillDecode,
-}
-
-fn weight_version(worker: &Arc<dyn Worker>) -> Option<&str> {
-    worker
-        .metadata()
-        .labels
-        .get("weight_version")
-        .map(String::as_str)
-}
-
-fn pd_model_identity(worker: &Arc<dyn Worker>) -> Option<(&str, Option<&str>, Option<&str>)> {
-    let model = worker.model_id();
-    if model.trim().is_empty() || model == UNKNOWN_MODEL_ID || model == "default" {
-        return None;
-    }
-    let labels = &worker.metadata().labels;
-    let path = labels.get("model_path").map(String::as_str);
-    let scope = labels.get("deployment_scope").map(String::as_str);
-    if path.is_some_and(|s| s.trim().is_empty()) || scope.is_some_and(|s| s.trim().is_empty()) {
-        return None;
-    }
-    Some((model, path, scope))
 }
 
 impl WorkerSelectionStage {
@@ -258,81 +237,17 @@ impl WorkerSelectionStage {
             false,
         );
 
-        let (available_prefill, available_decode): (Vec<_>, Vec<_>) =
+        let (prefill_workers, decode_workers): (Vec<_>, Vec<_>) =
             all_workers
                 .into_iter()
                 .fold((Vec::new(), Vec::new()), |mut acc, w| {
-                    if w.is_available() {
-                        match w.metadata().worker_type {
-                            WorkerType::Prefill { .. } => acc.0.push(w),
-                            WorkerType::Decode => acc.1.push(w),
-                            _ => {}
-                        }
+                    match w.metadata().worker_type {
+                        WorkerType::Prefill { .. } => acc.0.push(w),
+                        WorkerType::Decode => acc.1.push(w),
+                        _ => {}
                     }
                     acc
                 });
-
-        let matches_bound_version =
-            |worker: &Arc<dyn Worker>| match bound_weight_version.and_then(OnceLock::get) {
-                Some(bound) => weight_version(worker) == bound.as_deref(),
-                None => true,
-            };
-        let available_prefill: Vec<_> = available_prefill
-            .into_iter()
-            .filter(&matches_bound_version)
-            .collect();
-        let available_decode: Vec<_> = available_decode
-            .into_iter()
-            .filter(&matches_bound_version)
-            .collect();
-
-        if available_prefill.is_empty() {
-            warn!("No available prefill workers");
-            return None;
-        }
-
-        if available_decode.is_empty() {
-            warn!("No available decode workers");
-            return None;
-        }
-
-        let compatible = |prefill: &Arc<dyn Worker>, decode: &Arc<dyn Worker>| {
-            if !strict {
-                return true;
-            }
-            let identity = pd_model_identity(prefill);
-            identity.is_some()
-                && identity == pd_model_identity(decode)
-                && self
-                    .pd_weight_version_mode
-                    .compatible(weight_version(prefill), weight_version(decode))
-        };
-        // Apply strict identity constraints before invoking either policy.
-        let compatible_prefill: Vec<_> = available_prefill
-            .into_iter()
-            .filter(|prefill| {
-                available_decode
-                    .iter()
-                    .any(|decode| compatible(prefill, decode))
-            })
-            .collect();
-
-        if compatible_prefill.is_empty() {
-            warn!("No weight-version-compatible PD worker pairs");
-            return None;
-        }
-
-        // Without a requested model, strict mode needs one unambiguous model pool.
-        if strict && model_id.is_none() {
-            let first_model = pd_model_identity(&compatible_prefill[0]);
-            if compatible_prefill
-                .iter()
-                .any(|w| pd_model_identity(w) != first_model)
-            {
-                warn!("Strict PD selection requires an unambiguous model identity");
-                return None;
-            }
-        }
 
         // Select using policies
         let policy = match model_id {
@@ -351,13 +266,26 @@ impl WorkerSelectionStage {
             headers,
             hash_ring,
         };
-        let prefill_idx = policy.select_worker(&compatible_prefill, &info).await?;
-        let selected_prefill = compatible_prefill.get(prefill_idx)?.clone();
-        let compatible_decode: Vec<_> = available_decode
-            .into_iter()
-            .filter(|decode| compatible(&selected_prefill, decode))
-            .collect();
-        let decode_idx = policy.select_worker(&compatible_decode, &info).await?;
+
+        let (selected_prefill, selected_decode) = match PdPairPlanner::plan(PdPlanParams {
+            prefill_workers,
+            decode_workers,
+            prefill_policy: &*policy,
+            decode_policy: &*policy,
+            mode: self.pd_weight_version_mode,
+            model_id,
+            bound_weight_version,
+            select_info: &info,
+            required_connection_mode: None,
+        })
+        .await
+        {
+            Ok(pair) => pair,
+            Err(e) => {
+                warn!("{}", e);
+                return None;
+            }
+        };
 
         let model = model_id.unwrap_or(UNKNOWN_MODEL_ID);
         let policy_name = policy.name();
@@ -375,17 +303,6 @@ impl WorkerSelectionStage {
             model,
             policy_name,
         );
-
-        let selected_decode = compatible_decode.get(decode_idx)?.clone();
-        if let Some(bound) = bound_weight_version {
-            let selected_version = weight_version(&selected_prefill).map(str::to_string);
-            if bound.set(selected_version).is_err() {
-                debug_assert_eq!(
-                    bound.get().and_then(Option::as_deref),
-                    weight_version(&selected_prefill)
-                );
-            }
-        }
 
         Some((selected_prefill, selected_decode))
     }
